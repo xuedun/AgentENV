@@ -65,11 +65,11 @@ control_plane_port = 49983
 
 [image.resolver]
 # Rootfs image used when a template build omits fromImage.
-default_image = "ubuntu:24.04"
-
+# default_image = "ubuntu:24.04"
+default_image = "library/ubuntu:22.04"
 # Registries tried, in order, when resolving short image names.
-search_registries = ["docker.io", "ghcr.io"]
-
+#search_registries = ["docker.io", "ghcr.io"]
+search_registries = ["localhost:5000"]
 # Convert standard OCI tar layers into local OverlayBD commits. Set false to
 # require OverlayBD-native images or referrers and fail fast otherwise.
 convert_standard_oci = true

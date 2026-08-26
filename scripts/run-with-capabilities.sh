@@ -65,7 +65,8 @@ export AENV_HOME_PATH="${AENV_HOME_PATH:-${TMPDIR:-/tmp}/aenv-test-${run_uid}/ho
 export AENV_RUNTIME_PATH="${AENV_RUNTIME_PATH:-${TMPDIR:-/tmp}/aenv-test-${run_uid}/run}"
 validate_state_path AENV_HOME_PATH "$AENV_HOME_PATH"
 validate_state_path AENV_RUNTIME_PATH "$AENV_RUNTIME_PATH"
-
+export HOME="$(getent passwd "$run_user" | cut -d: -f6)"
+export DOCKER_CONFIG="$HOME/.docker"
 install -d -o "$run_user" -g "$run_group" -m 0750 \
     "${AENV_HOME_PATH:?}" "${AENV_RUNTIME_PATH:?}"
 
