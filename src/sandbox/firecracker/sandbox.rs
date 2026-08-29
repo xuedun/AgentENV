@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -1376,6 +1376,8 @@ impl FirecrackerSandbox {
         // the device — free_page_reporting will be absent for those VMs, which
         // is acceptable during rollout.
 
+        let t_begin = std::time::Instant::now();
+
         // Fail fast: memory restore requires a ublk device. Check before
         // allocating any resources (Firecracker process, network namespace, …).
         anyhow::ensure!(
@@ -1397,6 +1399,7 @@ impl FirecrackerSandbox {
             .context("snapshot rootfs image config is missing")?;
         self.current_rootfs_virtual_size = Some(rootfs_virtual_size);
 
+        let t_pre_warm = std::time::Instant::now();
         if config.common.stdout_path.is_none() && config.common.stderr_path.is_none() {
             if let Some(warm) = FirecrackerPool::global().and_then(|pool| pool.try_acquire()) {
                 let warm_dir = warm.work_dir.path();
@@ -1419,6 +1422,7 @@ impl FirecrackerSandbox {
                 }
             }
         }
+        let d_warm = t_pre_warm.elapsed();
 
         let fc_cwd = self.work_dir.path();
         let vm_state_src = fs::canonicalize(&config.vm_state_path)
@@ -1430,9 +1434,12 @@ impl FirecrackerSandbox {
         );
 
         // ── Tools drive: symlink rootfs.ext4 → tools drive (read-only, from snapshot config) ──
+        let t_tools = std::time::Instant::now();
         self.link_tools_drive(&config.common, fc_cwd)?;
+        let d_tools = t_tools.elapsed();
 
         // ── User image: restore overlaybd via ublk ──
+        let t_rootfs_ublk = std::time::Instant::now();
         if config.common.ublk_config.is_some() {
             let user_image_symlink = fc_cwd.join(USER_ROOTFS_DRIVE_PATH);
             let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
@@ -1473,13 +1480,17 @@ impl FirecrackerSandbox {
             });
             self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
         }
+        let d_rootfs_ublk = t_rootfs_ublk.elapsed();
 
         // ── Extra drives ──
+        let t_extra = std::time::Instant::now();
         self.prepare_snapshot_backing_drives(&config.common.extra_drives)
             .await
             .context("prepare snapshot-backed extra drives for resume")?;
+        let d_extra = t_extra.elapsed();
 
         // ── Network + Firecracker spawn ──
+        let t_net_spawn = std::time::Instant::now();
         let needs_socket_wait = self.network_slot.is_none();
         let interaction_ip = if let Some(slot) = self.network_slot.as_ref() {
             slot.host_interaction_ip
@@ -1511,8 +1522,10 @@ impl FirecrackerSandbox {
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
+        let d_net_spawn = t_net_spawn.elapsed();
 
         // ── Custom extension hook: start-resume ──
+        let t_hook = std::time::Instant::now();
         if let Some(client) = CustomExtensionClient::global() {
             let slot = self
                 .network_slot
@@ -1528,6 +1541,7 @@ impl FirecrackerSandbox {
                 .await?;
             self.custom_extension_hook_guard = Some(guard);
         }
+        let d_hook = t_hook.elapsed();
 
         let envd_base_url = format!(
             "http://{}:{}",
@@ -1538,6 +1552,7 @@ impl FirecrackerSandbox {
             config.common.envd_access_token.clone(),
         ));
 
+        let t_mem_ublk = std::time::Instant::now();
         let mem_global_config = global_config
             .memory_snapshot
             .overlaybd_global_config_path
@@ -1556,7 +1571,9 @@ impl FirecrackerSandbox {
         self.mem_snapshot_image_config_path =
             Some(config.mem_overlaybd_config.image_config_path.clone());
         self.mem_ublk_device = Some(mem_device);
+        let d_mem_ublk = t_mem_ublk.elapsed();
 
+        let t_socket = std::time::Instant::now();
         if needs_socket_wait {
             self.fc_instance
                 .wait_for_ready(
@@ -1565,11 +1582,15 @@ impl FirecrackerSandbox {
                 )
                 .await?;
         }
+        let d_socket = t_socket.elapsed();
 
+        let t_logger = std::time::Instant::now();
         self.configure_logger(&config.common).await?;
+        let d_logger = t_logger.elapsed();
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
+        let t_load = std::time::Instant::now();
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -1579,9 +1600,12 @@ impl FirecrackerSandbox {
                 config.common.track_dirty_pages,
             )
             .await?;
+        let d_load = t_load.elapsed();
 
+        let t_mmds = std::time::Instant::now();
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
+        let d_mmds = t_mmds.elapsed();
 
         // A restored snapshot inherits whatever limiter was active when it was
         // paused, so reconcile against the node's current config while the VM is
@@ -1589,13 +1613,37 @@ impl FirecrackerSandbox {
         // Both buckets are always overwritten (configured or unlimited) so an
         // inherited dimension the current config leaves unset is cleared rather
         // than left unchanged.
+        let t_limiter = std::time::Instant::now();
         let reconciled = reconcile_disk_rate_limiter(&config.common.disk_rate_limit)?;
         self.fc_instance
             .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
             .await
             .context("reconcile disk rate limiter on snapshot resume")?;
+        let d_limiter = t_limiter.elapsed();
 
+        let t_fc_resume = std::time::Instant::now();
         self.fc_instance.resume().await?;
+        let d_fc_resume = t_fc_resume.elapsed();
+
+        let d_total = t_begin.elapsed();
+        info!(
+            sandbox_id = %self.id,
+            d_total_ms = d_total.as_millis(),
+            d_warm_ms = d_warm.as_millis(),
+            d_tools_ms = d_tools.as_millis(),
+            d_rootfs_ublk_ms = d_rootfs_ublk.as_millis(),
+            d_extra_ms = d_extra.as_millis(),
+            d_net_spawn_ms = d_net_spawn.as_millis(),
+            d_hook_ms = d_hook.as_millis(),
+            d_mem_ublk_ms = d_mem_ublk.as_millis(),
+            d_socket_ms = d_socket.as_millis(),
+            d_logger_ms = d_logger.as_millis(),
+            d_load_ms = d_load.as_millis(),
+            d_mmds_ms = d_mmds.as_millis(),
+            d_limiter_ms = d_limiter.as_millis(),
+            d_fc_resume_ms = d_fc_resume.as_millis(),
+            "start_resume timing breakdown"
+        );
 
         debug!("sandbox restored from snapshot config");
         Ok(())
