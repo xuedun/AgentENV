@@ -43,6 +43,8 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_VERSION} AS envd-bu
 ARG ENVD_REF=2026.17
 ARG ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git
 ARG TARGETARCH
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
