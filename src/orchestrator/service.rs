@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
@@ -1974,10 +1974,12 @@ where
 
         let sandbox_id = plan.sandbox_id();
         let transitional_state = plan.transitional_state();
+        let t_begin = Instant::now();
 
         // Build and start the sandbox first, before making any state changes, so that we don't
         // have to roll back any persisted state if the build fails.
         // Meanwhile, the start process can be overlapped with the initial state persistence.
+        let t_build = Instant::now();
         let mut sandbox = match self.build_sandbox(&plan) {
             Ok(sandbox) => sandbox,
             Err(err) => {
@@ -1986,8 +1988,10 @@ where
                 return Err(err);
             }
         };
+        let d_build = t_build.elapsed();
 
         // Protect artifacts before the backend opens them.
+        let t_protect = Instant::now();
         let startup_artifacts = sandbox.startup_artifacts();
         if let Err(err) = self
             .protect_image_refs(
@@ -2002,6 +2006,9 @@ where
                 .await;
             return Err(err);
         }
+        let d_protect = t_protect.elapsed();
+
+        let t_start = Instant::now();
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
             if let Err(stop_err) = sandbox.stop().await {
@@ -2015,6 +2022,7 @@ where
                 source,
             });
         }
+        let d_start_nowait = t_start.elapsed();
         debug!("sandbox start requested");
 
         // If the orchestrator started shutting down, stop here before we persist any state.
@@ -2028,6 +2036,7 @@ where
             return Err(OrchestratorError::ShuttingDown);
         }
 
+        let t_register = Instant::now();
         let runtime_resources =
             resources_with_runtime_info(plan.resources(), sandbox.runtime_info());
         let transitional_metadata = plan.transitional_metadata().map(|metadata| {
@@ -2045,8 +2054,10 @@ where
 
         self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
             .await;
+        let d_register = t_register.elapsed();
 
         // Persist the sandbox metadata if needed (during creation).
+        let t_persist = Instant::now();
         if let Some(metadata) = transitional_metadata.as_ref() {
             if let Err(err) = self.store.add(metadata.clone()).await {
                 warn!(error = %format_args!("{err:#}"), "failed to persist sandbox metadata; cleaning up");
@@ -2055,6 +2066,7 @@ where
                 return Err(OrchestratorError::from(err));
             }
         }
+        let d_persist = t_persist.elapsed();
 
         // Check for shutdown again before we wait for the sandbox to become ready.
         if self.is_shutting_down() {
@@ -2065,10 +2077,12 @@ where
         }
 
         // Wait for the sandbox to be ready
+        let t_wait = Instant::now();
         let wait_result = {
             let sandbox = handle.lock().await;
             sandbox.wait_for_ready().await
         };
+        let d_wait_ready = t_wait.elapsed();
         if let Err(source) = wait_result {
             warn!(error = %format_args!("{source:#}"), "sandbox failed to become ready");
             self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
@@ -2088,6 +2102,7 @@ where
             return Err(OrchestratorError::ShuttingDown);
         }
 
+        let t_finalize = Instant::now();
         let launch_timeout = plan.timeout();
         let final_metadata = match self
             .store
@@ -2136,6 +2151,21 @@ where
                 warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
             }
         }
+        let d_finalize = t_finalize.elapsed();
+
+        let d_total = t_begin.elapsed();
+        info!(
+            sandbox_id = %sandbox_id,
+            d_total_ms = d_total.as_millis(),
+            d_build_ms = d_build.as_millis(),
+            d_protect_ms = d_protect.as_millis(),
+            d_start_nowait_ms = d_start_nowait.as_millis(),
+            d_register_ms = d_register.as_millis(),
+            d_persist_ms = d_persist.as_millis(),
+            d_wait_ready_ms = d_wait_ready.as_millis(),
+            d_finalize_ms = d_finalize.as_millis(),
+            "launch_sandbox timing breakdown"
+        );
 
         info!("sandbox launch completed");
         Ok(final_metadata)
