@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::sandbox::EnvdAccessToken;
 use envd::filesystem::FilesystemClient;
@@ -96,18 +96,25 @@ impl EnvdInstance {
             "waiting for envd"
         );
         let start = std::time::Instant::now();
+        let mut poll_count: u32 = 0;
 
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
-                return Err(anyhow!("timed out waiting for envd"));
+                return Err(anyhow!("timed out waiting for envd after {} polls", poll_count));
             }
 
             let remaining = timeout - elapsed;
             let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
+            let t_probe = std::time::Instant::now();
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
-                    debug!(base_path = %self.config.base_path, "envd started successfully");
+                    info!(
+                        poll_count,
+                        total_ms = start.elapsed().as_millis(),
+                        probe_ms = t_probe.elapsed().as_millis(),
+                        "envd wait_for_ready done"
+                    );
                     return Ok(());
                 }
                 Ok(Err(error)) => {
@@ -120,10 +127,11 @@ impl EnvdInstance {
                     );
                 }
             }
+            poll_count += 1;
 
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                return Err(anyhow!("timed out waiting for envd"));
+                return Err(anyhow!("timed out waiting for envd after {} polls", poll_count));
             }
             sleep(std::cmp::min(retry_interval, remaining)).await;
         }

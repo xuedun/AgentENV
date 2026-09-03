@@ -599,33 +599,48 @@ impl FirecrackerSandbox {
         let Some(envd_instance) = self.envd_instance.as_ref() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
+
+        let t_envd_wait = std::time::Instant::now();
         envd_instance
             .wait_for_ready(
                 self.runtime_policy.envd_timeout,
                 self.runtime_policy.envd_poll_interval,
             )
             .await?;
+        let d_envd_wait = t_envd_wait.elapsed();
+
+        let t_notify = std::time::Instant::now();
         if let Some(device_key) = &self.mem_snapshot_image_config_path {
-            // envd is up: release held background downloads for this memory
-            // device. Best-effort — downloads would also start after the
-            // fallback timeout.
             UblkDeviceManager::global()
                 .notify_sandbox_ready(device_key)
                 .await;
         }
         if let Some(device_key) = &self.rootfs_image_config_path {
-            // Same release for the rootfs image's background download.
             UblkDeviceManager::global()
                 .notify_sandbox_ready(device_key)
                 .await;
         }
+        let d_notify = t_notify.elapsed();
+
+        let t_envd_init = std::time::Instant::now();
         envd_instance
             .init(
                 self.launch.common().env_vars.clone(),
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
             )
-            .await
+            .await?;
+        let d_envd_init = t_envd_init.elapsed();
+
+        info!(
+            sandbox_id = %self.id,
+            d_envd_wait_ms = d_envd_wait.as_millis(),
+            d_notify_ms = d_notify.as_millis(),
+            d_envd_init_ms = d_envd_init.as_millis(),
+            "wait_for_ready breakdown"
+        );
+
+        Ok(())
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
