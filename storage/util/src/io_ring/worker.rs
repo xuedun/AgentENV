@@ -209,14 +209,19 @@ where
                 self.worker_id
             );
         };
+        let worker_id = self.worker_id;
         tokio::task::spawn_local({
             let uring = uring.clone();
             async move {
-                if let Err(err) = uring.handle_completion().await {
-                    panic!(
-                        "BackendWorker {} uring handle_completion has exited unexpectly: {err:?}",
-                        self.worker_id
-                    );
+                loop {
+                    if let Err(err) = uring.handle_completion().await {
+                        tracing::error!(
+                            worker_id,
+                            ?err,
+                            "handle_completion exited, restarting after 1s"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
         });
