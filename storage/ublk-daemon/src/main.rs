@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use nix::sys::resource::{setrlimit, Resource};
+use nix::sys::resource::{getrlimit, setrlimit, Resource};
 use serde::Deserialize;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -260,10 +260,16 @@ fn main() -> Result<()> {
     // getppid() is called on the main thread where the value is reliable.
     let parent_pid = nix::unistd::getppid();
 
-    // Raise file descriptor limit.
-    let target = 1_048_576;
-    if let Err(err) = setrlimit(Resource::RLIMIT_NOFILE, target, target) {
-        tracing::warn!(?err, target, "failed to raise RLIMIT_NOFILE");
+    // Raise file descriptor limit to the system hard limit.
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap_or((1024, 1024));
+    if soft < hard {
+        if let Err(err) = setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+            tracing::warn!(?err, ?soft, ?hard, "failed to raise RLIMIT_NOFILE");
+        } else {
+            tracing::info!(?soft, ?hard, "raised RLIMIT_NOFILE to hard limit");
+        }
+    } else {
+        tracing::info!(?soft, ?hard, "RLIMIT_NOFILE already at hard limit");
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
