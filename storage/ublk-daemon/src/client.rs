@@ -14,7 +14,7 @@ use crate::protocol::{
 use overlaybd::config::UpperMode;
 
 /// Default timeout for daemon RPC calls.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Timeout for snapshot operations (may be slow for large images).
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(360);
