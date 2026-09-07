@@ -273,7 +273,7 @@ fn main() -> Result<()> {
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(32)
+        .worker_threads(64)
         .enable_all()
         .build()
         .context("build tokio runtime")?;
