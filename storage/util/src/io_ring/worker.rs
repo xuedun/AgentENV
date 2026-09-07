@@ -182,8 +182,8 @@ where
         // #define IORING_MAX_REG_BUFFERS	(1U << 14)
         let ring = AsyncIoRingBuilder::<S>::new()
             .nr_sparse_buffer(4096)
-            .sqe_entries(2048)
-            .cqe_entries(4096)
+            .sqe_entries(8192)
+            .cqe_entries(16384)
             .build()
             .with_context(|| format!("create io uring for worker {worker_id}"))?;
         // init the uring
