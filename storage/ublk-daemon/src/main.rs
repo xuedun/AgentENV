@@ -326,10 +326,14 @@ fn main() -> Result<()> {
             load_pool_config(daemon_config.as_ref(), cli.enable_pool, &pool_overrides)
                 .context("load warm pool config")?
         {
-            server
-                .enable_pool(pool_config)
-                .await
-                .context("enable warm pool")?;
+            match server.enable_pool(pool_config).await {
+                Ok(()) => {
+                    tracing::info!("warm pool enabled");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to enable warm pool, continuing without pool");
+                }
+            }
         }
 
         // Open a pidfd for the parent process. When the parent process
