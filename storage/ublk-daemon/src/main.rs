@@ -343,6 +343,7 @@ fn main() -> Result<()> {
                 "detected ublk features"
             );
             server.enable_pool(pool_config, features);
+
         }
 
         // Open a pidfd for the parent process. When the parent process
