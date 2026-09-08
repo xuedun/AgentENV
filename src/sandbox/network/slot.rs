@@ -889,7 +889,7 @@ fn resolve_guest_dns_server() -> Ipv4Addr {
     }
 
     let fallback = Ipv4Addr::new(8, 8, 8, 8);
-    warn!(dns = %fallback, "falling back to public DNS for guest network");
+    debug!(dns = %fallback, "falling back to public DNS for guest network");
     fallback
 }
 
