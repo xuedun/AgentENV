@@ -21,7 +21,7 @@ use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
 use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
@@ -337,10 +337,13 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
 ) -> Result<PathBuf> {
+    let t_begin = std::time::Instant::now();
+
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
 
+    let t_load = std::time::Instant::now();
     let mut image_config = overlaybd::config::load_image_config(live_runtime_image_config_path)
         .with_context(|| {
             format!(
@@ -348,7 +351,9 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
                 live_runtime_image_config_path.display()
             )
         })?;
+    let d_load = t_load.elapsed();
 
+    let t_rewrite = std::time::Instant::now();
     let appended_layer = if let Some(snapshot_layer_path) = snapshot_layer_path {
         let expected_snapshot_path = fs::canonicalize(snapshot_layer_path)
             .unwrap_or_else(|_| snapshot_layer_path.to_path_buf());
@@ -382,11 +387,24 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     image_config.lowers = rewritten_lowers;
     image_config.upper = Default::default();
     image_config.result_file = "./result.txt".to_string();
+    let d_rewrite = t_rewrite.elapsed();
 
+    let t_write = std::time::Instant::now();
     let output_path = output_dir.join("image.json");
     let bytes = serde_json::to_vec_pretty(&image_config)
         .context("serialize overlaybd rootfs image config with inherited runtime layers")?;
     write_bytes_atomically(&output_path, &bytes, "overlaybd rootfs image config")?;
+    let d_write = t_write.elapsed();
+
+    let d_total = t_begin.elapsed();
+    info!(
+        d_total_ms = d_total.as_millis(),
+        d_load_ms = d_load.as_millis(),
+        d_rewrite_ms = d_rewrite.as_millis(),
+        d_write_ms = d_write.as_millis(),
+        "stage_overlaybd_snapshot timing breakdown"
+    );
+
     Ok(output_path)
 }
 
@@ -472,6 +490,8 @@ async fn capture_live_overlaybd_snapshot(
     output_dir: &Path,
     kind: &'static str,
 ) -> Result<LiveOverlaybdSnapshotState> {
+    let t_begin = std::time::Instant::now();
+
     if read_only {
         debug!(
             output_dir = %output_dir.display(),
@@ -480,6 +500,7 @@ async fn capture_live_overlaybd_snapshot(
         return Ok(LiveOverlaybdSnapshotState::ReadOnly);
     }
 
+    let t_prepare = std::time::Instant::now();
     let live_upper_data_path = restack_target_upper_data_path(live_runtime_image_config_path)
         .context("resolve restack source upper path")?;
     let snapshot_layer_path = output_dir.join("snapshot.commit");
@@ -503,12 +524,16 @@ async fn capture_live_overlaybd_snapshot(
             })?;
         live_snapshot_layer_path
     };
+    let d_prepare = t_prepare.elapsed();
 
+    let t_restack = std::time::Instant::now();
     let descriptor = UblkDeviceManager::global()
         .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
+    let d_restack = t_restack.elapsed();
 
+    let t_copy = std::time::Instant::now();
     if live_snapshot_layer_path != snapshot_layer_path {
         // If this cross-filesystem copy fails, leave the live runtime config
         // untouched and surface a terminal pause failure. The daemon has
@@ -544,7 +569,9 @@ async fn capture_live_overlaybd_snapshot(
             );
         }
     }
+    let d_copy = t_copy.elapsed();
 
+    let t_rewrite = std::time::Instant::now();
     rewrite_live_runtime_config_for_restack(
         live_runtime_image_config_path,
         &snapshot_layer_path,
@@ -553,6 +580,18 @@ async fn capture_live_overlaybd_snapshot(
     .await
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
+    let d_rewrite = t_rewrite.elapsed();
+
+    let d_total = t_begin.elapsed();
+    info!(
+        kind,
+        d_total_ms = d_total.as_millis(),
+        d_prepare_ms = d_prepare.as_millis(),
+        d_restack_ms = d_restack.as_millis(),
+        d_copy_ms = d_copy.as_millis(),
+        d_rewrite_ms = d_rewrite.as_millis(),
+        "capture_live_overlaybd_snapshot timing breakdown"
+    );
 
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
 }
@@ -762,26 +801,40 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
 ) -> Result<(PathBuf, u64)> {
+    let t_begin = std::time::Instant::now();
+
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
 
-    let data_path = output_dir.join("overlaybd.commit");
+    let t_mappings = std::time::Instant::now();
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
+    let d_mappings = t_mappings.elapsed();
+
+    let t_compact = std::time::Instant::now();
     let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
     let src_layers = vec![source_file];
     publish_memory_overlaybd_layer(
         &src_layers,
         &mappings,
         memory_size,
-        &data_path,
+        &output_dir.join("overlaybd.commit"),
         mode,
         DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
     )
     .await
     .context("compact dirty memory ranges as overlaybd layer")?;
+    let d_compact = t_compact.elapsed();
 
-    Ok((data_path, memory_size))
+    let d_total = t_begin.elapsed();
+    info!(
+        d_total_ms = d_total.as_millis(),
+        d_mappings_ms = d_mappings.as_millis(),
+        d_compact_ms = d_compact.as_millis(),
+        "convert_dirty_memory_to_overlaybd timing breakdown"
+    );
+
+    Ok((output_dir.join("overlaybd.commit"), memory_size))
 }
 
 #[cfg(test)]

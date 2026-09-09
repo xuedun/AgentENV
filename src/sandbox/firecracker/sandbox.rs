@@ -677,37 +677,64 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
-        self.fc_instance.pause().await?;
+        let t_begin = std::time::Instant::now();
 
+        let t_fc_pause = std::time::Instant::now();
+        self.fc_instance.pause().await?;
+        let d_fc_pause = t_fc_pause.elapsed();
+
+        let t_create_dir = std::time::Instant::now();
         tokio::fs::create_dir_all(snapshot_dir)
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
+        let d_create_dir = t_create_dir.elapsed();
 
+        let t_snapshot = std::time::Instant::now();
         let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
-        match snapshot_result {
-            Ok(snapshot) => Ok(snapshot),
+        let d_snapshot = t_snapshot.elapsed();
+
+        let snapshot = match snapshot_result {
+            Ok(snapshot) => snapshot,
             Err(err) => {
                 Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+
+        let d_total = t_begin.elapsed();
+        info!(
+            sandbox_id = %self.id,
+            d_total_ms = d_total.as_millis(),
+            d_fc_pause_ms = d_fc_pause.as_millis(),
+            d_create_dir_ms = d_create_dir.as_millis(),
+            d_snapshot_ms = d_snapshot.as_millis(),
+            "pause_to_dir timing breakdown"
+        );
+
+        Ok(snapshot)
     }
 
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
+        let t_begin = std::time::Instant::now();
+
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
             &ConfigManager::global_config().memory_snapshot,
         );
+
+        let t_mem = std::time::Instant::now();
         let (mem_layer_path, mem_virtual_size) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
+        let d_mem_snapshot = t_mem.elapsed();
 
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
         // count exceeds the configured maximum.
+        let t_mem_cfg = std::time::Instant::now();
         let resume_mem_image_config_path = match &self.launch {
             LaunchMode::Resume(config) => {
                 Some(config.mem_overlaybd_config.image_config_path.as_path())
@@ -735,12 +762,15 @@ impl FirecrackerSandbox {
             )
         })?;
 
+        let d_mem_config = t_mem_cfg.elapsed();
+
         let mem_overlaybd_config = OverlaybdConfig {
             image_config_path: mem_image_config_path,
             read_only: true,
             runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
         };
 
+        let t_rootfs = std::time::Instant::now();
         let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
             let overlaybd_source = self
                 .launch
@@ -777,10 +807,16 @@ impl FirecrackerSandbox {
                 .context("persist rootfs virtual size for snapshot")?;
             (rootfs_path, size)
         };
+        let d_rootfs_restack = t_rootfs.elapsed();
+
+        let t_extra = std::time::Instant::now();
         let snapshot_extra_drives = self
             .snapshot_extra_drives(snapshot_dir)
             .await
             .context("snapshot extra drives to persistent dir")?;
+        let d_extra_drives = t_extra.elapsed();
+
+        let t_finalize = std::time::Instant::now();
         let mut snapshot_common = self.launch.common().clone();
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
@@ -826,6 +862,20 @@ impl FirecrackerSandbox {
             managed_snapshot_root: None,
         };
 
+        let d_finalize = t_finalize.elapsed();
+        let d_total = t_begin.elapsed();
+
+        info!(
+            sandbox_id = %self.id,
+            d_total_ms = d_total.as_millis(),
+            d_mem_snapshot_ms = d_mem_snapshot.as_millis(),
+            d_mem_config_ms = d_mem_config.as_millis(),
+            d_rootfs_restack_ms = d_rootfs_restack.as_millis(),
+            d_extra_drives_ms = d_extra_drives.as_millis(),
+            d_finalize_ms = d_finalize.as_millis(),
+            "snapshot_to_dir timing breakdown"
+        );
+
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
             mem_image_config_path = %snapshot.mem_overlaybd_config.image_config_path.display(),
@@ -841,23 +891,46 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
         memory_output: OverlaybdCompactOutput,
     ) -> Result<(PathBuf, u64)> {
+        let t_begin = std::time::Instant::now();
+
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
         let firecracker_pid = self.fc_instance.pid()?;
+
+        let t_create = std::time::Instant::now();
         self.fc_instance
             .create_state_only_snapshot(vm_state_path)
             .await?;
+        let d_create_snap = t_create.elapsed();
+
         // `vm_state.bin` now represents this paused VM state. Any later
         // error aborts this direct snapshot attempt and is propagated to
         // the lifecycle caller for recovery.
+        let t_dirty = std::time::Instant::now();
         let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-        convert_dirty_memory_to_overlaybd(
+        let d_get_dirty = t_dirty.elapsed();
+
+        let t_convert = std::time::Instant::now();
+        let (data_path, memory_size) = convert_dirty_memory_to_overlaybd(
             firecracker_pid,
             &dirty_ranges,
             &mem_overlaybd_dir,
             memory_output,
         )
         .await
-        .context("convert dirty memory ranges to overlaybd layer")
+        .context("convert dirty memory ranges to overlaybd layer")?;
+        let d_convert = t_convert.elapsed();
+
+        let d_total = t_begin.elapsed();
+        info!(
+            sandbox_id = %self.id,
+            d_total_ms = d_total.as_millis(),
+            d_create_snap_ms = d_create_snap.as_millis(),
+            d_get_dirty_ms = d_get_dirty.as_millis(),
+            d_convert_ms = d_convert.as_millis(),
+            "snapshot_memory_to_overlaybd timing breakdown"
+        );
+
+        Ok((data_path, memory_size))
     }
 
     /// Resume a paused sandbox in-place.
@@ -885,15 +958,19 @@ impl FirecrackerSandbox {
     #[tracing::instrument(skip(self))]
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
+        let t_begin = std::time::Instant::now();
 
+        let t_fc_stop = std::time::Instant::now();
         self.fc_instance
             .stop(self.runtime_policy.socket_timeout)
             .await?;
+        let d_fc_stop = t_fc_stop.elapsed();
 
         // Clear envd instance
         self.envd_instance = None;
 
         // Cleanup ublk device (must happen after FC stop, before network cleanup)
+        let t_release = std::time::Instant::now();
         if let Some(runtime) = self.rootfs_runtime.take() {
             if let Err(e) = UblkDeviceManager::global()
                 .release_device(&runtime.device)
@@ -919,14 +996,18 @@ impl FirecrackerSandbox {
                 warn!(error = %e, "failed to release extra drive device during stop");
             }
         }
+        let d_release = t_release.elapsed();
 
         // Invoke the stop hook before releasing network resources. Delivery
         // failures are logged inside the client and never fail stop().
+        let t_hook = std::time::Instant::now();
         if let Some(guard) = self.custom_extension_hook_guard.take() {
             guard.stop().await;
         }
+        let d_hook_stop = t_hook.elapsed();
 
         // Cleanup network resources
+        let t_net = std::time::Instant::now();
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
             NetworkManager::global()
@@ -934,6 +1015,18 @@ impl FirecrackerSandbox {
                 .context("Failed to release network slot")?;
             debug!(slot = idx, "network slot released");
         }
+        let d_net_release = t_net.elapsed();
+
+        let d_total = t_begin.elapsed();
+        info!(
+            sandbox_id = %self.id,
+            d_total_ms = d_total.as_millis(),
+            d_fc_stop_ms = d_fc_stop.as_millis(),
+            d_release_ms = d_release.as_millis(),
+            d_hook_stop_ms = d_hook_stop.as_millis(),
+            d_net_release_ms = d_net_release.as_millis(),
+            "stop timing breakdown"
+        );
 
         debug!("firecracker sandbox stopped");
         Ok(())

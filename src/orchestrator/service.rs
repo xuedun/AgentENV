@@ -1061,6 +1061,9 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
+        let t_pause_begin = Instant::now();
+
+        let t_pre = Instant::now();
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
@@ -1146,8 +1149,10 @@ where
             self.store.remove(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
+        let d_pre_pause = t_pre.elapsed();
 
         // Pause the sandbox and capture the paused state for resuming later.
+        let t_pause = Instant::now();
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
             sandbox.pause(artifact_root.as_deref()).await
@@ -1193,7 +1198,9 @@ where
                 });
             }
         };
+        let d_pause = t_pause.elapsed();
 
+        let t_persist = Instant::now();
         let persisted_metadata = {
             let mut metadata = self
                 .store
@@ -1251,8 +1258,10 @@ where
         }
         let resources = persisted_metadata.resources;
         self.store.update(persisted_metadata).await?;
+        let d_persist = t_persist.elapsed();
 
         // Stop the sandbox to free up resources.
+        let t_stop = Instant::now();
         let stop_result = {
             let mut sandbox = handle.lock().await;
             sandbox.stop().await
@@ -1260,7 +1269,20 @@ where
         if let Err(err) = stop_result {
             warn!(error = ?err, "failed to stop sandbox after pausing");
         }
+        let d_stop = t_stop.elapsed();
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
+
+        let d_total = t_pause_begin.elapsed();
+        info!(
+            sandbox_id = %sandbox_id,
+            d_total_ms = d_total.as_millis(),
+            d_pre_pause_ms = d_pre_pause.as_millis(),
+            d_pause_ms = d_pause.as_millis(),
+            d_persist_ms = d_persist.as_millis(),
+            d_stop_ms = d_stop.as_millis(),
+            "pause_sandbox_inner timing breakdown"
+        );
+
         info!("sandbox paused");
 
         Ok(())
@@ -1298,6 +1320,9 @@ where
         self.ensure_accepting_lifecycle_operations()?;
 
         info!("resuming sandbox");
+        let t_resume_begin = Instant::now();
+
+        let t_retrieve = Instant::now();
         let mut metadata = self
             .store
             .get(&sandbox_id)
@@ -1367,7 +1392,9 @@ where
             }
             Err(err) => return Err(OrchestratorError::from(err)),
         }
+        let d_retrieve = t_retrieve.elapsed();
 
+        let t_state_cas = Instant::now();
         if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
             let _ = self
@@ -1384,6 +1411,8 @@ where
             OrchestratorError::InternalError("missing paused state".to_string())
         })?;
 
+        let d_state_cas = t_state_cas.elapsed();
+
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
                 sandbox_id,
@@ -1395,6 +1424,8 @@ where
                     .then(|| self.access_tokens.generate(metadata.id)),
             ))
             .await;
+        let d_launch = t_state_cas.elapsed() - d_state_cas;
+
         if let Ok(metadata) = resumed.as_ref() {
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
@@ -1404,6 +1435,17 @@ where
                 metadata.resources,
             );
         }
+
+        let d_total = t_resume_begin.elapsed();
+        info!(
+            sandbox_id = %sandbox_id,
+            d_total_ms = d_total.as_millis(),
+            d_retrieve_ms = d_retrieve.as_millis(),
+            d_state_cas_ms = d_state_cas.as_millis(),
+            d_launch_ms = d_launch.as_millis(),
+            "resume_sandbox_inner timing breakdown"
+        );
+
         resumed
     }
 
