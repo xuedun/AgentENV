@@ -190,6 +190,16 @@ pub struct FirecrackerSandbox {
     /// recording VMs (`pack_recording = true`). Released with
     /// `UblkDeviceManager::delete_device`, never returned to the warm pool.
     mem_dedicated_device: Option<UblkDevice>,
+    /// Base ublk device for dual-backend memory sharing.
+    /// None when dual-backend is disabled or degraded to single-backend.
+    mem_base_ublk_device: Option<SharedReadOnlyDevice>,
+    /// Base template ID for dual-backend memory sharing.
+    /// None when this sandbox IS a base template or dual-backend is disabled.
+    /// Set during start_resume, used during pause to write baseTemplate into image.json.
+    base_template: Option<String>,
+    /// Number of base layers in the current template's lowers.
+    /// Used for compaction protection and compute_file_offset_ranges.
+    base_layer_count: Option<usize>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
@@ -1208,6 +1218,8 @@ impl FirecrackerSandbox {
             &mem_layer_path,
             snapshot_dir,
             OverlaybdCompactOutput::Raw,
+            self.base_template.as_deref(),
+            self.base_layer_count.unwrap_or(0),
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1323,6 +1335,7 @@ impl FirecrackerSandbox {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
+            base_mem_image_config_path: None,
         };
 
         debug!(
@@ -1472,6 +1485,11 @@ impl FirecrackerSandbox {
                 warn!(%error, "failed to release shared memory ublk device during stop");
             }
         }
+        if let Some(base_device) = self.mem_base_ublk_device.take() {
+            if let Err(error) = base_device.release().await {
+                warn!(%error, "failed to release base memory ublk device during stop");
+            }
+        }
         if let Some(error) = network_error {
             return Err(error);
         }
@@ -1554,6 +1572,129 @@ impl FirecrackerSandbox {
         let sandbox_dir = self.id.to_string();
         let root = managed_snapshot_base().join(sandbox_dir);
         Arc::new(PersistentSnapshotRootGuard::new(root))
+    }
+
+    /// Set up dual-backend: create base + delta ublk devices and compute region_backends.
+    ///
+    /// Returns (delta_device_path, Option<base_device>, Option<region_backends>).
+    async fn setup_dual_backend(
+        &mut self,
+        config: &FirecrackerSnapshotConfig,
+        mem_image_config: &overlaybd::config::ImageConfig,
+        mem_global_config: &Path,
+        _vm_state_src: &Path,
+    ) -> Result<(
+        PathBuf,
+        Option<SharedReadOnlyDevice>,
+        Option<Vec<firecracker_client::models::RegionBackendConfig>>,
+    )> {
+        let base_image_config_path = config
+            .base_mem_image_config_path
+            .as_ref()
+            .context("base_mem_image_config_path not set")?;
+
+        let base_image_config = overlaybd::config::load_image_config(base_image_config_path)
+            .context("load base template image config")?;
+        let base_layer_count = base_image_config.lowers.len();
+
+        // Create/reuse base ublk device
+        let base_device = UblkDeviceManager::global()
+            .get_or_create_shared_mem(
+                &UblkCreateSpec::Overlaybd {
+                    image_config: base_image_config_path.clone(),
+                    global_config: mem_global_config.to_path_buf(),
+                },
+                config.mem_virtual_size,
+            )
+            .await
+            .context("create or reuse base memory ublk device")?;
+
+        // Create/reuse delta ublk device (existing logic)
+        let delta_device = UblkDeviceManager::global()
+            .get_or_create_shared_mem(
+                &UblkCreateSpec::Overlaybd {
+                    image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                    global_config: mem_global_config.to_path_buf(),
+                },
+                config.mem_virtual_size,
+            )
+            .await
+            .context("create or reuse delta memory ublk device")?;
+
+        // Compute file offset ranges
+        let ranges = super::overlaybd_snapshot::compute_file_offset_ranges(
+            mem_image_config,
+            base_layer_count,
+            config.mem_virtual_size,
+        )
+        .await
+        .context("compute file offset ranges for dual-backend")?;
+
+        // KVM slot limit check
+        const MAX_KVM_SLOTS: usize = 509;
+        if ranges.len() > MAX_KVM_SLOTS {
+            anyhow::bail!(
+                "dual-backend ranges {} exceed KVM slot limit {}",
+                ranges.len(),
+                MAX_KVM_SLOTS
+            );
+        }
+
+        // Build RegionBackendConfig list
+        let base_path = base_device.device_path().to_path_buf();
+        let delta_path = delta_device.device_path().to_path_buf();
+        let region_backends: Vec<firecracker_client::models::RegionBackendConfig> = ranges
+            .iter()
+            .map(|r| {
+                let path = match r.backend {
+                    super::overlaybd_snapshot::BackendKind::Base => &base_path,
+                    super::overlaybd_snapshot::BackendKind::Delta => &delta_path,
+                };
+                firecracker_client::models::RegionBackendConfig::new(
+                    r.file_offset as i64,
+                    r.size as i64,
+                    path.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+
+        // Set fields
+        self.mem_snapshot_image_config_path =
+            Some(config.mem_overlaybd_config.image_config_path.clone());
+        self.mem_ublk_device = Some(delta_device);
+        self.mem_base_ublk_device = Some(base_device);
+        self.base_template = mem_image_config.base_template.clone();
+        self.base_layer_count = Some(base_layer_count);
+
+        Ok((delta_path, self.mem_base_ublk_device.clone(), Some(region_backends)))
+    }
+
+    /// Fallback to single-backend mode: create only delta device, no region_backends.
+    async fn fallback_single_backend(
+        &mut self,
+        config: &FirecrackerSnapshotConfig,
+        mem_global_config: &Path,
+    ) -> Result<(
+        PathBuf,
+        Option<SharedReadOnlyDevice>,
+        Option<Vec<firecracker_client::models::RegionBackendConfig>>,
+    )> {
+        let delta_device = UblkDeviceManager::global()
+            .get_or_create_shared_mem(
+                &UblkCreateSpec::Overlaybd {
+                    image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                    global_config: mem_global_config.to_path_buf(),
+                },
+                config.mem_virtual_size,
+            )
+            .await
+            .context("create or reuse shared memory ublk device for resume")?;
+        let delta_path = delta_device.device_path().to_path_buf();
+        self.mem_snapshot_image_config_path =
+            Some(config.mem_overlaybd_config.image_config_path.clone());
+        self.mem_ublk_device = Some(delta_device);
+        self.mem_base_ublk_device = None;
+        Ok((delta_path, None, None))
     }
 
     async fn live_snapshot_root(&mut self) -> Result<Arc<PersistentSnapshotRootGuard>> {
@@ -1749,6 +1890,9 @@ impl FirecrackerSandbox {
             mem_ublk_device: None,
             tools_ublk_device: None,
             mem_dedicated_device: None,
+            mem_base_ublk_device: None,
+            base_template: None,
+            base_layer_count: None,
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
@@ -2156,6 +2300,7 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .overlaybd_global_config_path
             .clone();
+        let mut region_backends: Option<Vec<firecracker_client::models::RegionBackendConfig>> = None;
         let mem_device_path = if config.pack_recording {
             // Pack-recording VMs get a dedicated, non-shared memory device:
             // sharing one (or the block-device page cache behind it) would
@@ -2217,17 +2362,41 @@ impl FirecrackerSandbox {
                     }
                 }
             }
-            let mem_device = UblkDeviceManager::global()
-                .get_or_create_shared_mem(
-                    &UblkCreateSpec::Overlaybd {
-                        image_config: config.mem_overlaybd_config.image_config_path.clone(),
-                        global_config: mem_global_config.clone(),
-                    },
-                    config.mem_virtual_size,
-                )
-                .await
-                .context("create or reuse shared memory ublk device for resume")?;
-            let device_path = mem_device.device_path().to_path_buf();
+            let enable_dual_backend = global_config.memory_snapshot.enable_dual_backend;
+            let mem_image_config = overlaybd::config::load_image_config(
+                &config.mem_overlaybd_config.image_config_path,
+            )
+            .context("load mem image config for dual-backend check")?;
+
+            let dual_backend_eligible = enable_dual_backend
+                && mem_image_config.base_template.is_some()
+                && config.base_mem_image_config_path.is_some()
+                && mem_image_config.lowers.len() > 1
+                && !mem_image_config.lowers[0].file.is_empty();
+
+            let (mem_device_path, _base_device, rbs) = if dual_backend_eligible {
+                match self
+                    .setup_dual_backend(
+                        &config,
+                        &mem_image_config,
+                        &mem_global_config,
+                        &vm_state_src,
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "dual-backend setup failed, falling back to single backend"
+                        );
+                        self.fallback_single_backend(&config, &mem_global_config).await?
+                    }
+                }
+            } else {
+                self.fallback_single_backend(&config, &mem_global_config).await?
+            };
+            region_backends = rbs;
 
             if let Some(pack) = &config.memory_startup_pack {
                 if matches!(
@@ -2237,19 +2406,18 @@ impl FirecrackerSandbox {
                     if let Some(task) = self.startup_prefetch_task.take() {
                         task.stop(self.runtime_policy.socket_timeout).await;
                     }
-                    self.startup_prefetch_task =
-                        Some(super::startup_pack::submit_local_startup_prefetch(
-                            mem_device.clone(),
-                            mem_global_config.clone(),
-                            pack.clone(),
-                        ));
+                    if let Some(mem_device) = self.mem_ublk_device.as_ref() {
+                        self.startup_prefetch_task =
+                            Some(super::startup_pack::submit_local_startup_prefetch(
+                                mem_device.clone(),
+                                mem_global_config.clone(),
+                                pack.clone(),
+                            ));
+                    }
                 }
             }
 
-            self.mem_snapshot_image_config_path =
-                Some(config.mem_overlaybd_config.image_config_path.clone());
-            self.mem_ublk_device = Some(mem_device);
-            device_path
+            mem_device_path
         };
 
         if needs_socket_wait {
@@ -2265,15 +2433,28 @@ impl FirecrackerSandbox {
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
-        self.fc_instance
-            .load_snapshot_file(
-                &vm_state_src,
-                &mem_device_path,
-                &network_overrides,
-                false,
-                config.common.track_dirty_pages,
-            )
-            .await?;
+        if let Some(ref rbs) = region_backends {
+            self.fc_instance
+                .load_snapshot_multi_backend(
+                    &vm_state_src,
+                    rbs,
+                    &mem_device_path,
+                    &network_overrides,
+                    false,
+                    config.common.track_dirty_pages,
+                )
+                .await?;
+        } else {
+            self.fc_instance
+                .load_snapshot_file(
+                    &vm_state_src,
+                    &mem_device_path,
+                    &network_overrides,
+                    false,
+                    config.common.track_dirty_pages,
+                )
+                .await?;
+        }
 
         // A volume absent from the source state was loaded as a placeholder.
         // Replace and PATCH it once so Firecracker reopens the path and reports
@@ -3234,6 +3415,8 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
             pack_recording: false,
+            memory_startup_pack: None,
+            base_mem_image_config_path: None,
         });
 
         assert_eq!(
@@ -3267,6 +3450,7 @@ mod tests {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
+            base_mem_image_config_path: None,
         };
 
         let child = FirecrackerSandbox::from_snapshot_config_with_override(
@@ -3321,6 +3505,8 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
             pack_recording: false,
+            memory_startup_pack: None,
+            base_mem_image_config_path: None,
         })?;
         let common = value["common"]
             .as_object_mut()

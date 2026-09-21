@@ -477,6 +477,11 @@ pub struct FirecrackerSnapshotConfig {
     /// a manifest). Runtime-only, never persisted.
     #[serde(skip)]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
+    /// Pre-resolved base template image config path for dual-backend.
+    /// Populated by the factory when baseTemplate is present in mem_image.json.
+    /// None when dual-backend is not applicable.
+    #[serde(skip)]
+    pub base_mem_image_config_path: Option<PathBuf>,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -564,6 +569,7 @@ impl FirecrackerSnapshotConfig {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: manifest.memory_startup_pack.clone(),
+            base_mem_image_config_path: None,
         })
     }
 
@@ -893,6 +899,7 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
             pack_recording: false,
+            base_mem_image_config_path: None,
         };
 
         let err = snapshot

@@ -530,6 +530,21 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// memory layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
+    /// Enable dual-backend memory sharing for cross-template buffer cache
+    /// sharing of base pages. When disabled, start_resume uses single-backend
+    /// mode (original behavior). Default: false for gradual rollout.
+    #[config(default = false)]
+    pub enable_dual_backend: bool,
+
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }

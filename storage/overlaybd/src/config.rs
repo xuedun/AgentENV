@@ -154,6 +154,12 @@ pub struct ImageConfig {
     pub download_override: Option<DownloadConfig>,
     pub acceleration_layer: bool,
     pub record_trace_path: String,
+    /// Optional base template identity for dual-backend memory sharing.
+    /// When set, this template's base ublk device is shared with all
+    /// other templates that have the same base_template.
+    /// When absent, this template IS a base template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_template: Option<String>,
 }
 
 impl ImageConfig {

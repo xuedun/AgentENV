@@ -11,13 +11,14 @@
 use crate::models;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryBackend {
     #[serde(rename = "backend_type")]
     pub backend_type: BackendType,
-    /// Based on 'backend_type' it is either 1) Path to the file that contains the guest memory to be loaded 2) Path to the UDS where a process is listening for a UFFD initialization control payload and open file descriptor that it can use to serve this process's guest memory page faults
     #[serde(rename = "backend_path")]
     pub backend_path: String,
+    #[serde(rename = "region_backends", skip_serializing_if = "Option::is_none")]
+    pub region_backends: Option<Vec<models::RegionBackendConfig>>,
 }
 
 impl MemoryBackend {
@@ -25,6 +26,19 @@ impl MemoryBackend {
         MemoryBackend {
             backend_type,
             backend_path,
+            region_backends: None,
+        }
+    }
+
+    pub fn with_region_backends(
+        backend_type: BackendType,
+        backend_path: String,
+        region_backends: Vec<models::RegionBackendConfig>,
+    ) -> MemoryBackend {
+        MemoryBackend {
+            backend_type,
+            backend_path,
+            region_backends: Some(region_backends),
         }
     }
 }
