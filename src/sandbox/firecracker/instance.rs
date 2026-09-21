@@ -12,7 +12,7 @@ use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
     MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
-    SnapshotCreateParams, SnapshotLoadParams, Vm,
+    RegionBackendConfig, SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
@@ -539,6 +539,45 @@ impl FirecrackerInstance {
             .request_no_content(Method::PUT, "/snapshot/load", Some(&params))
             .await
             .context("Failed to load snapshot with file backend")
+    }
+
+    /// Loads a snapshot with multiple per-GPA-range memory backends (dual-backend mode).
+    /// Pre-boot only.
+    #[tracing::instrument(skip(self, network_overrides), fields(snapshot_path = %snapshot_path.display(), region_count = region_backends.len()))]
+    pub async fn load_snapshot_multi_backend(
+        &self,
+        snapshot_path: &Path,
+        region_backends: &[RegionBackendConfig],
+        delta_backend_path: &Path,
+        network_overrides: &[(&str, &str)],
+        resume_vm: bool,
+        track_dirty_pages: bool,
+    ) -> Result<()> {
+        let snapshot_path = self.resolve_host_path(snapshot_path);
+        let mut params = SnapshotLoadParams::new(snapshot_path.to_string_lossy().into_owned());
+        let backend_path_str = delta_backend_path.to_string_lossy().into_owned();
+        let rb_vec: Vec<firecracker_client::models::RegionBackendConfig> = region_backends.to_vec();
+        params.mem_backend = Some(Box::new(MemoryBackend::with_region_backends(
+            firecracker_client::models::memory_backend::BackendType::File,
+            backend_path_str,
+            rb_vec,
+        )));
+        params.resume_vm = Some(resume_vm);
+        params.track_dirty_pages = Some(track_dirty_pages);
+        if !network_overrides.is_empty() {
+            params.network_overrides = Some(
+                network_overrides
+                    .iter()
+                    .map(|(iface_id, host_dev_name)| {
+                        NetworkOverride::new(iface_id.to_string(), host_dev_name.to_string())
+                    })
+                    .collect(),
+            );
+        }
+        self.client
+            .request_no_content(Method::PUT, "/snapshot/load", Some(&params))
+            .await
+            .context("Failed to load snapshot with multi-backend")
     }
 
     fn resolve_host_path(&self, path: &Path) -> PathBuf {

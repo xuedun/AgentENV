@@ -1578,6 +1578,41 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+      region_backends:
+        type: array
+        description: >
+          Optional per-range backend mapping for dual-backend memory sharing.
+          When provided, Firecracker mmaps different backend files for different
+          GPA ranges, enabling cross-template buffer cache sharing of base pages.
+          When absent, falls back to single-backend mode using backend_path.
+        items:
+          $ref: "#/definitions/RegionBackendConfig"
+
+  RegionBackendConfig:
+    type: object
+    required:
+      - file_offset
+      - size
+      - backend_path
+    properties:
+      file_offset:
+        type: integer
+        format: int64
+        minimum: 0
+        description: >
+          Starting file offset (position within the contiguous guest memory
+          layout) of this backend range. Firecracker internally converts
+          this to a guest physical address using GuestMemoryState, accounting
+          for the MMIO hole. Ranges that cross the hole are automatically split.
+          This value is also used as the mmap offset into the backend device.
+      size:
+        type: integer
+        format: int64
+        minimum: 0
+        description: Size in bytes of the range covered by this backend.
+      backend_path:
+        type: string
+        description: Path to the backend file or block device for this range.
 
   Metrics:
     type: object

@@ -72,6 +72,8 @@ pub mod pmem;
 pub use self::pmem::Pmem;
 pub mod rate_limiter;
 pub use self::rate_limiter::RateLimiter;
+pub mod region_backend_config;
+pub use self::region_backend_config::RegionBackendConfig;
 pub mod serial_device;
 pub use self::serial_device::SerialDevice;
 pub mod snapshot_create_params;

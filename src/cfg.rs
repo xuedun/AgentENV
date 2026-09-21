@@ -461,6 +461,11 @@ pub struct MemorySnapshotConfig {
     /// memory layer. 1 = sequential (identical output layout at any value).
     #[config(default = 1)]
     pub compression_workers: usize,
+    /// Enable dual-backend memory sharing for cross-template buffer cache
+    /// sharing of base pages. When disabled, start_resume uses single-backend
+    /// mode (original behavior). Default: false for gradual rollout.
+    #[config(default = false)]
+    pub enable_dual_backend: bool,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }

@@ -106,17 +106,31 @@ fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
 /// Published or cache-owned layers must be materialized before that
 /// suffix; otherwise adopting only the tail would either leave a dangling
 /// runtime artifact reference or change lower precedence.
+///
+/// `base_layer_count` protects the first N layers from compaction regardless
+/// of their path. Pass 0 for rootfs (original behavior), pass the actual
+/// base layer count for memory snapshots.
 fn split_runtime_suffix(
     mut lowers: Vec<LayerConfig>,
     runtime_owned_roots: &[PathBuf],
+    base_layer_count: usize,
 ) -> (Vec<LayerConfig>, Vec<LayerConfig>) {
-    let Some(first_runtime_owned_index) = lowers.iter().position(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .any(|root| lower_path.starts_with(root))
-    }) else {
+    if lowers.len() <= base_layer_count {
+        return (lowers, Vec::new());
+    }
+
+    // base_layer_count=0: lowers[0..] = lowers (original behavior)
+    let Some(first_runtime_owned_index) = lowers[base_layer_count..]
+        .iter()
+        .position(|lower| {
+            let lower_path =
+                fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
+            runtime_owned_roots
+                .iter()
+                .any(|root| lower_path.starts_with(root))
+        })
+        .map(|i| i + base_layer_count)
+    else {
         return (lowers, Vec::new());
     };
 
@@ -382,6 +396,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         MANAGED_BASE_LAYER_FILE,
         // Rootfs layers must stay raw: only memory snapshots may be compressed.
         OverlaybdCompactOutput::Raw,
+        0, // rootfs: no base layer protection, original behavior
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -414,6 +429,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     compaction_output: OverlaybdCompactOutput,
+    base_layer_count: usize,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
@@ -422,6 +438,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
         compaction_output,
+        base_layer_count,
     )
     .await
 }
@@ -433,9 +450,10 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
+    base_layer_count: usize,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
-        split_runtime_suffix(existing_lowers, runtime_owned_roots);
+        split_runtime_suffix(existing_lowers, runtime_owned_roots, base_layer_count);
 
     // If the total number of lowers exceeds the default maximum, try to compact the
     // runtime-owned suffix and appended layers into a single layer.
@@ -601,6 +619,8 @@ pub(super) async fn build_mem_snapshot_image_config(
     new_layer_path: &Path,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
+    base_template: Option<&str>,
+    base_layer_count: usize,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
@@ -611,12 +631,14 @@ pub(super) async fn build_mem_snapshot_image_config(
         Some(new_layer),
         "mem_compacted.commit",
         memory_output,
+        base_layer_count,
     )
     .await?;
 
     Ok(ImageConfig {
         repo_blob_url: inherited_image_config.repo_blob_url,
         lowers,
+        base_template: base_template.map(|s| s.to_string()),
         ..Default::default()
     })
 }
@@ -972,7 +994,7 @@ mod tests {
         ];
 
         let (preserved, managed) =
-            split_runtime_suffix(lowers, canonicalized_runtime_owned_roots());
+            split_runtime_suffix(lowers, canonicalized_runtime_owned_roots(), 0);
 
         assert_eq!(preserved.len(), 2);
         assert_eq!(preserved[0].file, "");
@@ -1020,6 +1042,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            0,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1130,6 +1153,8 @@ mod tests {
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
+            None,
+            0,
         )
         .await
         .expect("build memory image config");
@@ -1198,4 +1223,118 @@ mod tests {
             existing
         );
     }
+}
+
+// ── Dual-backend: compute base/delta file offset ranges ─────────────────────
+
+/// A file offset range tagged as belonging to the base or delta backend.
+#[derive(Debug, Clone)]
+pub(super) struct FileOffsetRange {
+    pub file_offset: u64,
+    pub size: u64,
+    pub backend: BackendKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackendKind {
+    Base,
+    Delta,
+}
+
+/// Compute base/delta file offset ranges by reading delta layer indexes.
+///
+/// Opens each delta layer's commit file, loads its LSMT index, merges all
+/// delta indexes, then iterates through the merged mappings to find gaps
+/// (base ranges) and hits (delta ranges). Performs 4KB page alignment and
+/// merges contiguous same-backend ranges.
+///
+/// Reuses the same code pattern as `compact_layers` (`sandbox/ublk/overlaybd.rs`):
+/// LocalFile → tar adaptor → switch file → `open_file_index`.
+pub(super) async fn compute_file_offset_ranges(
+    mem_image_config: &ImageConfig,
+    base_layer_count: usize,
+    mem_virtual_size: u64,
+) -> Result<Vec<FileOffsetRange>> {
+    const ALIGNMENT: u64 = 512;
+    const PAGE_SIZE: u64 = 4096;
+    let delta_layers = &mem_image_config.lowers[base_layer_count..];
+
+    // 1. Open each delta layer, load its index
+    let io_ring = overlaybd::transient_io_ring::shared_transient_io_ring();
+    let mut delta_indexes = Vec::new();
+    for layer in delta_layers {
+        let path = std::path::Path::new(&layer.file);
+        let local: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::open_ro(path, io_ring.clone())
+                .await
+                .with_context(|| format!("open delta layer for index: {}", path.display()))?,
+        );
+        let tar_adapted = overlaybd::backend::tar::new_tar_file_adaptor(local)
+            .await
+            .with_context(|| format!("adapt delta layer as tar file: {}", path.display()))?;
+        let display = path.display().to_string();
+        let switched = overlaybd::backend::switch::new_switch_file(tar_adapted, true, Some(&display))
+            .await
+            .with_context(|| format!("open delta layer via switch file: {}", path.display()))?;
+        let index = overlaybd::index_file::open_file_index(switched)
+            .await
+            .with_context(|| format!("load delta layer index: {}", path.display()))?;
+        delta_indexes.push(index);
+    }
+
+    // 2. Merge all delta layer indexes
+    let refs: Vec<&overlaybd::index::ReadOnlyIndex> = delta_indexes.iter().collect();
+    let merged = overlaybd::index::ReadOnlyIndex::merge(&refs);
+
+    // 3. Iterate through delta mappings, find gaps → base, align to 4KB, merge contiguous
+    let mut result = Vec::new();
+    let mut cursor = 0u64;
+
+    for m in merged.mappings() {
+        // Align delta range outward to 4KB boundaries
+        // (extra sectors become delta, which is safe since delta device has data)
+        let delta_start = (m.offset() * ALIGNMENT).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let delta_end = ((m.offset() as u64 + m.length() as u64) * ALIGNMENT) / PAGE_SIZE * PAGE_SIZE;
+
+        if delta_start > cursor {
+            // Gap before this delta mapping → base
+            push_or_merge(&mut result, cursor, delta_start - cursor, BackendKind::Base);
+        }
+        if delta_end > delta_start {
+            push_or_merge(&mut result, delta_start, delta_end - delta_start, BackendKind::Delta);
+        }
+        cursor = cursor.max(delta_end);
+    }
+
+    // Trailing base
+    if cursor < mem_virtual_size {
+        push_or_merge(
+            &mut result,
+            cursor,
+            mem_virtual_size - cursor,
+            BackendKind::Base,
+        );
+    }
+
+    Ok(result)
+}
+
+/// Push a new range or merge with the last one if same backend and contiguous.
+fn push_or_merge(
+    result: &mut Vec<FileOffsetRange>,
+    file_offset: u64,
+    size: u64,
+    backend: BackendKind,
+) {
+    if let Some(last) = result.last_mut() {
+        if last.backend == backend && last.file_offset + last.size == file_offset {
+            last.size += size;
+            return;
+        }
+    }
+    result.push(FileOffsetRange {
+        file_offset,
+        size,
+        backend,
+    });
 }

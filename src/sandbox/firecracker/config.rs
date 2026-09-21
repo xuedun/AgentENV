@@ -464,6 +464,11 @@ pub struct FirecrackerSnapshotConfig {
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
     pub(super) managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Pre-resolved base template image config path for dual-backend.
+    /// Populated by the factory when baseTemplate is present in mem_image.json.
+    /// None when dual-backend is not applicable.
+    #[serde(skip)]
+    pub base_mem_image_config_path: Option<PathBuf>,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -531,6 +536,7 @@ impl FirecrackerSnapshotConfig {
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
+            base_mem_image_config_path: None,
         })
     }
 
@@ -848,6 +854,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            base_mem_image_config_path: None,
         };
 
         let err = snapshot
