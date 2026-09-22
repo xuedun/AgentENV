@@ -16,7 +16,6 @@ use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
 use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
-    FIRECRACKER_BACKEND,
 };
 use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
@@ -30,28 +29,28 @@ use tokio::time::Duration;
 /// Fallback boot arguments when `config.firecracker.boot_args` is not set.
 /// Keep DAMON parameters in sync with `config/default.toml`.
 ///
-/// DAMON reclaim parameters:
-///   min_age        = 100 000 us (100 ms) — page must be cold for 100 ms before reclaim
-///   quota_ms       = 20            — spend at most 20 ms per quota interval reclaiming
+/// DAMON reclaim parameters (conservative initial values — TODO: tune per workload):
+///   min_age        = 60 000 000 ns (60 s) — page must be cold for 60 s before reclaim
+///   quota_ms       = 100           — spend at most 100 ms per quota interval reclaiming
 ///   quota_sz       = 1 GiB         — reclaim at most 1 GiB per quota interval
-///   quota_reset_interval_ms = 500  — reset quota counters every 500 ms
-///   wmarks_high    = 990 (‰)       — stop reclaim when free pages > 99 %
-///   wmarks_mid     = 990 (‰)       — start reclaim when free pages < 99 %
-///   wmarks_low     = 200 (‰)       — stop DAMON below 20 % and fall back to LRU reclaim
-///   wmarks_interval= 1 000 000 us  — check watermarks every 1 s
+///   quota_reset_interval_ms = 1000 — reset quota counters every 1 s
+///   wmarks_high    = 900 (‰)      — stop reclaim when free pages > 90 %
+///   wmarks_mid     = 700 (‰)      — start reclaim when free pages < 70 %
+///   wmarks_low     = 200 (‰)      — aggressive reclaim below 20 %
+///   wmarks_interval= 5 000 000 us  — check watermarks every 5 s
 ///   skip_anon      = Y             — only reclaim file-backed (pagecache) pages
 const DEFAULT_BOOT_ARGS: &str = "\
     console=ttyS0 reboot=k panic=1 pci=off \
     damon_reclaim.enabled=Y \
-    damon_reclaim.min_age=100000 \
-    damon_reclaim.quota_ms=20 \
+    damon_reclaim.min_age=60000000 \
+    damon_reclaim.quota_ms=100 \
     damon_reclaim.quota_sz=1073741824 \
-    damon_reclaim.quota_reset_interval_ms=500 \
-    damon_reclaim.wmarks_high=990 \
-    damon_reclaim.wmarks_mid=990 \
+    damon_reclaim.quota_reset_interval_ms=1000 \
+    damon_reclaim.wmarks_high=900 \
+    damon_reclaim.wmarks_mid=700 \
     damon_reclaim.wmarks_low=200 \
     damon_reclaim.skip_anon=Y \
-    damon_reclaim.wmarks_interval=1000000";
+    damon_reclaim.wmarks_interval=5000000";
 pub(super) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
 
 #[derive(Debug)]
@@ -122,15 +121,12 @@ pub struct FirecrackerCommonConfig {
     /// Base directory for Firecracker serial output.
     /// The actual serial output files will be created under `{serial_output_base_dir}/{sandbox_id}/`.
     ///
-    /// Used only when logging is enabled. Overridden by explicit stdout/stderr destinations.
+    /// Overriden by `stdout_path` and `stderr_path` if they are set.
     pub serial_output_base_dir: Option<PathBuf>,
-    /// Explicit stdout directory; enables capture even without a log level.
     pub stdout_path: Option<PathBuf>,
-    /// Explicit stderr directory; enables capture even without a log level.
     pub stderr_path: Option<PathBuf>,
-    /// Optional Firecracker log level. A non-empty value enables stdout/stderr
-    /// capture and Firecracker logging to `firecracker.log`. Unset/empty disables both
-    /// unless an explicit stdout/stderr destination is provided.
+    /// Optional Firecracker log level. When set (non-empty), Firecracker logging
+    /// is enabled and written to a `firecracker.log` file alongside the stdout log.
     pub firecracker_log_level: Option<String>,
     pub runtime_policy: FirecrackerRuntimePolicy,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshot capture.
@@ -151,13 +147,6 @@ pub struct FirecrackerCommonConfig {
     #[serde(default)]
     pub rootfs_allow_shrink: bool,
     pub extra_drives: Vec<ExtraDrive>,
-    /// Extra drives physically present in the Firecracker snapshot before its
-    /// reserved launch-time volume slots.
-    #[serde(default)]
-    pub physical_extra_drive_count: usize,
-    /// Existing placeholder drives that can be rebound to launch-time volumes.
-    #[serde(default)]
-    pub volume_drive_slots: usize,
     pub ublk_config: Option<UblkConfig>,
     /// Cluster-wide CPU intersection received from the scheduler.
     /// When set, applied via `PUT /cpu-config` before the VM boots.
@@ -205,8 +194,6 @@ impl FirecrackerCommonConfig {
             rootfs_virtual_size: None,
             rootfs_allow_shrink: false,
             extra_drives: Vec::new(),
-            physical_extra_drive_count: 0,
-            volume_drive_slots: 0,
             ublk_config: None,
             cpu_config_json: None,
             network_policy: None,
@@ -246,7 +233,7 @@ impl FirecrackerCommonConfig {
 
     pub fn validate(&self) -> Result<()> {
         let config = ConfigManager::global_config();
-        self.resolved_tools_drive_path(config)?;
+        let tools_drive_path = self.resolved_tools_drive_path(config)?;
         if !cfg!(target_os = "linux") {
             anyhow::bail!("Firecracker requires a Linux host");
         }
@@ -254,6 +241,21 @@ impl FirecrackerCommonConfig {
             anyhow::bail!(
                 "firecracker binary not found at {}",
                 self.firecracker_binary.display()
+            );
+        }
+        if !tools_drive_path.exists() {
+            anyhow::bail!(
+                "tools drive version '{}' is not installed on this node; resolved path: {}; dependency root: {}; install this immutable release before launching the sandbox",
+                self.tools_drive_version,
+                tools_drive_path.display(),
+                config.deps_path.display()
+            );
+        }
+        if !tools_drive_path.is_file() {
+            anyhow::bail!(
+                "tools drive version '{}' resolved to a non-file path: {}",
+                self.tools_drive_version,
+                tools_drive_path.display()
             );
         }
         self.validate_persisted_artifacts()
@@ -308,10 +310,6 @@ impl FirecrackerCommonConfig {
 
         Ok(Some(output_dir))
     }
-}
-
-pub(super) fn logging_enabled(log_level: Option<&str>) -> bool {
-    log_level.is_some_and(|level| !level.trim().is_empty())
 }
 
 pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {
@@ -477,11 +475,6 @@ pub struct FirecrackerSnapshotConfig {
     /// a manifest). Runtime-only, never persisted.
     #[serde(skip)]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
-    /// Pre-resolved base template image config path for dual-backend.
-    /// Populated by the factory when baseTemplate is present in mem_image.json.
-    /// None when dual-backend is not applicable.
-    #[serde(skip)]
-    pub base_mem_image_config_path: Option<PathBuf>,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -489,14 +482,6 @@ impl FirecrackerSnapshotConfig {
         let mut base_common =
             FirecrackerCommonConfig::from_global_config().context("load sandbox common config")?;
         let manifest = snapshot.manifest();
-        if manifest.backend != FIRECRACKER_BACKEND {
-            bail!(
-                "snapshot '{}' was captured by the {} backend, and a capture is restored by \
-                 the VMM which took it",
-                snapshot.record().id,
-                manifest.backend
-            );
-        }
 
         let app_config = ConfigManager::global_config();
         let snapshot_mode = snapshot.committed().virtualization_mode;
@@ -533,14 +518,6 @@ impl FirecrackerSnapshotConfig {
         // starts for the first time. When resuming from a snapshot, the full CPU state
         // is already serialised inside vm_state.bin, so re-applying a template would
         // be incorrect and is rejected by Firecracker anyway.
-        let extra_drives = manifest.extra_drives();
-        let physical_extra_drive_count = if manifest.volume_drive_slots == 0 {
-            // Snapshots created before reserved volume slots existed contain
-            // only physical attached drives.
-            extra_drives.len()
-        } else {
-            manifest.physical_extra_drive_count
-        };
         let snapshot_common = FirecrackerCommonConfig {
             ublk_config: Some(overlaybd_ublk_config),
             envd_version: snapshot.committed().runtime_versions.envd_version.clone(),
@@ -549,9 +526,7 @@ impl FirecrackerSnapshotConfig {
             default_user: build_context.user.clone(),
             rootfs_image_config: Some(rootfs_image_config),
             rootfs_virtual_size: Some(manifest.rootfs.virtual_size),
-            extra_drives,
-            physical_extra_drive_count,
-            volume_drive_slots: manifest.volume_drive_slots,
+            extra_drives: manifest.extra_drives(),
             ..base_common
         };
 
@@ -569,7 +544,6 @@ impl FirecrackerSnapshotConfig {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: manifest.memory_startup_pack.clone(),
-            base_mem_image_config_path: None,
         })
     }
 
@@ -655,17 +629,13 @@ fn validate_overlaybd_extra_drive(
     if !drive_ids.insert(drive_id.to_string()) {
         anyhow::bail!("duplicate extra drive id: {}", drive_id);
     }
-    let mount_path = crate::sandbox::normalize_mount_path(drive.mount_path().to_path_buf())?;
-    if mount_paths
-        .iter()
-        .any(|existing| existing.starts_with(&mount_path) || mount_path.starts_with(existing))
-    {
+    crate::sandbox::validate_mount_path(drive.mount_path())?;
+    if !mount_paths.insert(drive.mount_path().to_path_buf()) {
         anyhow::bail!(
-            "overlapping extra drive mount path: {}",
+            "duplicate extra drive mount path: {}",
             drive.mount_path().display()
         );
     }
-    mount_paths.insert(mount_path);
     if matches!(drive.virtual_size(), Some(0)) {
         anyhow::bail!("extra drive virtual size must be non-zero: {}", drive_id);
     }
@@ -683,7 +653,7 @@ fn validate_overlaybd_extra_drive(
 mod tests {
     use super::*;
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
-    use crate::snapshot::{CommittedSnapshot, ResolvedAttachedDrive, SnapshotRecord};
+    use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -817,8 +787,6 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
-                snapshot_output_dir: None,
-                volume: false,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -827,8 +795,6 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
-                snapshot_output_dir: None,
-                volume: false,
             },
         ];
 
@@ -850,7 +816,7 @@ mod tests {
         );
         config.extra_drives = (0..=MAX_EXTRA_DRIVES)
             .map(|i| {
-                let drive_id = format!("data_{i}");
+                let drive_id = format!("data-{i}");
                 ExtraDrive::Overlaybd {
                     mount_path: ExtraDrive::default_mount_path(&drive_id),
                     drive_id,
@@ -861,8 +827,6 @@ mod tests {
                     read_only: true,
                     virtual_size: None,
                     sub_path: None,
-                    snapshot_output_dir: None,
-                    volume: false,
                 }
             })
             .collect();
@@ -888,7 +852,6 @@ mod tests {
         .common;
         common.rootfs_virtual_size = Some(0);
         let mut snapshot = FirecrackerSnapshotConfig {
-            memory_startup_pack: None,
             common,
             vm_state_path: vm_state_path.clone(),
             mem_overlaybd_config: OverlaybdConfig {
@@ -899,7 +862,6 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
             pack_recording: false,
-            base_mem_image_config_path: None,
         };
 
         let err = snapshot
@@ -943,28 +905,6 @@ mod tests {
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
 
         assert_eq!(config.common.tools_drive_version, snapshot_version);
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_runnable_snapshot_treats_manifest_drives_as_physical() -> Result<()> {
-        let drive = ResolvedAttachedDrive::Overlaybd {
-            drive_id: "data".to_owned(),
-            image_config_path: "/tmp/data.json".into(),
-            read_only: true,
-            virtual_size: 4096,
-            mount_path: ExtraDrive::default_mount_path("data"),
-            sub_path: None,
-        };
-        let snapshot = RunnableSnapshot::from_test_legacy_manifest(
-            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
-            vec![drive],
-        );
-
-        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
-
-        assert_eq!(config.common.physical_extra_drive_count, 1);
-        assert_eq!(config.common.volume_drive_slots, 0);
         Ok(())
     }
 

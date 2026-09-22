@@ -30,7 +30,7 @@ virtualization_mode = "kvm"
 
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.
-boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init page_reporting.page_reporting_order=6 damon_reclaim.enabled=Y damon_reclaim.min_age=100000 damon_reclaim.quota_ms=20 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=500 damon_reclaim.wmarks_high=990 damon_reclaim.wmarks_mid=990 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=1000000"
+boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
 
 # Prefix allowlist for cold-start request extraBootArgs. Empty means none.
 # allowed_extra_boot_args_prefixes = ["aenv-custom."]
@@ -41,13 +41,12 @@ socket_timeout_secs = 3
 socket_poll_ms = 1
 
 # Per-sandbox work directories contain sockets, local logs, and writable
-# OverlayBD upper layers. When enabled, serial logs persist separately by sandbox ID.
+# OverlayBD upper layers. Serial logs persist separately by sandbox ID.
 # work_dir = "$AENV_HOME/firecracker-work"
 # serial_dir = "$AENV_HOME/logs/serial"
 
-# Enable stdout/stderr capture and firecracker.log. Supported levels are Error,
-# Warning, Info, Debug, and Trace; unset or empty disables all Firecracker logs.
-# Setting serial_dir alone does not enable logging.
+# Enable Firecracker's own firecracker.log beside the serial log. Supported
+# levels are Error, Warning, Info, Debug, and Trace; unset disables it.
 # log_level = "Info"
 
 [kernel]
@@ -193,17 +192,8 @@ poll_ms = 3
 # AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
 # same explicit value on every node when cross-node sandbox recovery is required.
 # access_token_hash_seed = "replace-with-a-secret"
-[volume]
-# Maximum persistent volume size in MiB (256 GiB by default).
-max_size_mb = 262144
-# Maximum number of persistent volumes a sandbox may mount.
-max_volume_count = 4
 
 [orchestrator]
-# Guest metrics collection interval in seconds. Set to 0 to disable collection.
-metrics_interval_secs = 15
-# Guest metrics in-memory retention period in seconds.
-metrics_retention_secs = 3600
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
 # Default sandbox lifetime in seconds when a request omits it.
@@ -236,35 +226,6 @@ p2p_enabled = true
 # [snapshot.image_publish]
 # enabled = true
 
-# Compress memory layers and incremental read-write layers once, when they are
-# uploaded to OSS/ACR. Local layers always stay raw, so local resume pays no
-# decompression cost; enabled by default to cut network bytes for cross-node
-# resume. Disable when upload CPU matters more than transfer bytes.
-[snapshot.publish_compression]
-enabled = true
-# Supported algorithms are "lz4" and "zstd".
-algorithm = "lz4"
-# Workers compressing 4 KiB blocks. One is sequential; higher values run in
-# parallel without changing the output layout.
-workers = 1
-
-# Optional for OSS and POSIX backends: record the guest's startup memory pages once per snapshot
-# at publish time (a short local re-resume on the capture node, ~10s budget),
-# store a tiny v4 page manifest, and prefetch the listed positions
-# concurrently on cold resume. Pages not yet prefetched fall back to the
-# normal on-demand path immediately. `consume_enabled` only gates resume-side
-# consumption so A/B runs can compare the same snapshot with/without it;
-# `consume_timeout_secs` bounds a manifest's queueing plus local or remote reads.
-# [snapshot.memory_startup_pack]
-# enabled = false
-# record_min_window_ms = 200
-# record_quiet_ms = 300
-# record_max_window_ms = 2000
-# record_budget_secs = 10
-# max_pack_bytes = 1073741824
-# consume_enabled = false
-# consume_timeout_secs = 30
-
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]
@@ -273,8 +234,8 @@ workers = 1
 # OSS requires an endpoint, bucket, region, and either credential_process or
 # static credentials. credential_process takes precedence over static values.
 # [backend.oss]
-# endpoint = "https://<your-oss-endpoint>"
-# bucket = "your-snapshot-bucket"
+# endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
+# bucket = "agentenv-snapshots"
 # region = "cn-beijing"
 # Bucket addressing style: "virtual" or "path". Leave unset to use
 # endpoint-based auto-detection.
@@ -310,7 +271,6 @@ runtime_upper_mode = "hybridLogStructured"
 allow_shrink = false
 # Cold-start resize timeout in seconds; must be positive (120 = 2 minutes).
 resize_timeout_secs = 120
-remote_io_workers = 4
 # Enable layer-level background download for remote rootfs layers.
 download_enable = false
 # P2P descriptor lookup timeout in milliseconds; timeout is a cacheable miss.
@@ -331,9 +291,8 @@ maintenance_enabled = true
 [pool.block]
 # Enable the reusable OverlayBD ublk-device pool.
 enabled = true
-# Omit to prewarm only when the kernel supports UBLK_F_UPDATE_SIZE. Set an
-# explicit boolean to override capability-based selection.
-# startup_prewarm = true
+# Populate it after the first reusable image shape is known.
+startup_prewarm = true
 
 [pool.firecracker]
 # Enable pre-spawned Firecracker processes for snapshot resume.
@@ -351,6 +310,21 @@ fill_concurrency = 4
 # It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
+
+# Enable dual-backend memory sharing for cross-template buffer cache reuse.
+# When true, sandboxes from the same base template share a base ublk device
+# (read-only), while each sandbox gets its own delta ublk device for dirty pages.
+# Set to false to use single-backend mode (original behavior).
+enable_dual_backend = true
+
+# Compress memory snapshot layers. The algorithm is parsed but ignored when
+# compression is disabled.
+compression_enabled = false
+# Supported algorithms are "lz4" and "zstd".
+compression_algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+compression_workers = 1
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
@@ -372,17 +346,6 @@ concurrency = 4
 # block_size must not exceed 2 GiB; defaults use 256 MiB. Per-image overrides
 # cannot resize it.
 max_inflight_blocks = 16
-
-[template_build]
-# Per-node cap, including preparation, publication, and cleanup. Excess starts return 429.
-max_concurrent_builds = 4
-# The first Dockerfile build prepares a reusable internal builder template.
-# Each build mounts its own clone of the shared cache seed.
-builder_image = "docker.io/moby/buildkit:v0.33.0"
-builder_cpu_count = 16
-builder_memory_mb = 32768
-# Persistent /var/lib/buildkit disk in MiB (64 GiB). Applies to new caches.
-cache_size_mb = 65536
 
 [observability]
 # Expose node identity, host metrics, and orchestrator runtime metrics.

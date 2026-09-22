@@ -1335,7 +1335,6 @@ impl FirecrackerSandbox {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
-            base_mem_image_config_path: None,
         };
 
         debug!(
@@ -1588,12 +1587,12 @@ impl FirecrackerSandbox {
         Option<SharedReadOnlyDevice>,
         Option<Vec<firecracker_client::models::RegionBackendConfig>>,
     )> {
-        let base_image_config_path = config
-            .base_mem_image_config_path
+        let base_template_path = mem_image_config
+            .base_template
             .as_ref()
-            .context("base_mem_image_config_path not set")?;
+            .context("base_template not set in mem image config")?;
 
-        let base_image_config = overlaybd::config::load_image_config(base_image_config_path)
+        let base_image_config = overlaybd::config::load_image_config(base_template_path)
             .context("load base template image config")?;
         let base_layer_count = base_image_config.lowers.len();
 
@@ -1601,7 +1600,7 @@ impl FirecrackerSandbox {
         let base_device = UblkDeviceManager::global()
             .get_or_create_shared_mem(
                 &UblkCreateSpec::Overlaybd {
-                    image_config: base_image_config_path.clone(),
+                    image_config: base_template_path.clone(),
                     global_config: mem_global_config.to_path_buf(),
                 },
                 config.mem_virtual_size,
@@ -2370,7 +2369,6 @@ impl FirecrackerSandbox {
 
             let dual_backend_eligible = enable_dual_backend
                 && mem_image_config.base_template.is_some()
-                && config.base_mem_image_config_path.is_some()
                 && mem_image_config.lowers.len() > 1
                 && !mem_image_config.lowers[0].file.is_empty();
 
@@ -3416,7 +3414,6 @@ mod tests {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
-            base_mem_image_config_path: None,
         });
 
         assert_eq!(
@@ -3450,7 +3447,6 @@ mod tests {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
-            base_mem_image_config_path: None,
         };
 
         let child = FirecrackerSandbox::from_snapshot_config_with_override(
@@ -3506,7 +3502,6 @@ mod tests {
             managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
-            base_mem_image_config_path: None,
         })?;
         let common = value["common"]
             .as_object_mut()
