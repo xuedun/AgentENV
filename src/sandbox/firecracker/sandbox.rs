@@ -1213,12 +1213,22 @@ impl FirecrackerSandbox {
             }
             LaunchMode::Fresh(_) => None,
         };
+        // When base_template is not set (original template, single-backend mode),
+        // record the resume template path as base_template so that the next
+        // resume can create a dual-backend (base + delta) setup.
+        let base_template_for_snapshot: Option<String> = self
+            .base_template
+            .clone()
+            .or_else(|| {
+                resume_mem_image_config_path
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
         let mem_image_config = build_mem_snapshot_image_config(
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
-            OverlaybdCompactOutput::Raw,
-            self.base_template.as_deref(),
+            memory_output,
+            base_template_for_snapshot.as_deref(),
             self.base_layer_count.unwrap_or(0),
         )
         .await?;

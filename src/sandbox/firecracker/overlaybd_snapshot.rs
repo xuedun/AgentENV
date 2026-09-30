@@ -1376,6 +1376,9 @@ pub(super) async fn compute_file_offset_ranges(
     let merged = overlaybd::index::ReadOnlyIndex::merge(&refs);
 
     // 3. Iterate through delta mappings, find gaps → base, align to 4KB, merge contiguous
+    // Small gaps between delta mappings are merged into delta to avoid exceeding
+    // the KVM slot limit (509). Only large gaps use the base device.
+    const MIN_BASE_GAP: u64 = 2 * 1024 * 1024; // 2 MiB
     let mut result = Vec::new();
     let mut cursor = 0u64;
 
@@ -1386,8 +1389,14 @@ pub(super) async fn compute_file_offset_ranges(
         let delta_end = ((m.offset() as u64 + m.length() as u64) * ALIGNMENT) / PAGE_SIZE * PAGE_SIZE;
 
         if delta_start > cursor {
-            // Gap before this delta mapping → base
-            push_or_merge(&mut result, cursor, delta_start - cursor, BackendKind::Base);
+            let gap_size = delta_start - cursor;
+            if gap_size >= MIN_BASE_GAP {
+                // Large gap → base
+                push_or_merge(&mut result, cursor, gap_size, BackendKind::Base);
+            } else {
+                // Small gap → merge into delta to reduce range count
+                push_or_merge(&mut result, cursor, gap_size, BackendKind::Delta);
+            }
         }
         if delta_end > delta_start {
             push_or_merge(&mut result, delta_start, delta_end - delta_start, BackendKind::Delta);
