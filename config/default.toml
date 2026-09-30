@@ -26,7 +26,7 @@ virtualization_mode = "kvm"
 [firecracker]
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
-# binary_path = "/opt/agentenv/bin/firecracker"
+binary_path = "/home/cxd/firecracker/build/cargo_target/aarch64-unknown-linux-gnu/debug/firecracker"
 
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.

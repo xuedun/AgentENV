@@ -105,7 +105,7 @@ where
         .spawn(move || {
             let result = (|| {
                 before_capability_scope()?;
-                linux_cap::configure_current_process_capabilities(capabilities)?;
+                // linux_cap::configure_current_process_capabilities(capabilities)?;
 
                 let _runtime_guard = runtime.enter();
                 command.kill_on_drop(true);

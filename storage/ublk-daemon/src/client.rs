@@ -167,7 +167,7 @@ impl UblkDaemonClient {
         Self::wait_for_socket_available(&config.socket_path).await?;
 
         let mut cmd = tokio::process::Command::new(config.binary_path);
-        configure_daemon_capabilities(&mut cmd)?;
+        // configure_daemon_capabilities(&mut cmd)?;
         cmd.arg("--socket-path")
             .arg(&config.socket_path)
             .arg("--global-config")
