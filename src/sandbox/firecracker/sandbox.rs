@@ -1227,7 +1227,7 @@ impl FirecrackerSandbox {
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
-            memory_output,
+            OverlaybdCompactOutput::Raw,
             base_template_for_snapshot.as_deref(),
             self.base_layer_count.unwrap_or(0),
         )
@@ -1601,8 +1601,9 @@ impl FirecrackerSandbox {
             .base_template
             .as_ref()
             .context("base_template not set in mem image config")?;
+        let base_template_path = std::path::PathBuf::from(base_template_path);
 
-        let base_image_config = overlaybd::config::load_image_config(base_template_path)
+        let base_image_config = overlaybd::config::load_image_config(&base_template_path)
             .context("load base template image config")?;
         let base_layer_count = base_image_config.lowers.len();
 
@@ -1630,6 +1631,14 @@ impl FirecrackerSandbox {
             .await
             .context("create or reuse delta memory ublk device")?;
 
+        tracing::debug!(
+            base_dev_path = %base_device.device_path().display(),
+            delta_dev_path = %delta_device.device_path().display(),
+            base_template_path = %base_template_path.display(),
+            base_layer_count,
+            "dual-backend devices created/reused"
+        );
+
         // Compute file offset ranges
         let ranges = super::overlaybd_snapshot::compute_file_offset_ranges(
             mem_image_config,
@@ -1640,7 +1649,7 @@ impl FirecrackerSandbox {
         .context("compute file offset ranges for dual-backend")?;
 
         // KVM slot limit check
-        const MAX_KVM_SLOTS: usize = 509;
+        const MAX_KVM_SLOTS: usize = 32767; // matches KVM_USER_MEM_SLOTS on kernel 6.6
         if ranges.len() > MAX_KVM_SLOTS {
             anyhow::bail!(
                 "dual-backend ranges {} exceed KVM slot limit {}",
@@ -1666,6 +1675,13 @@ impl FirecrackerSandbox {
                 )
             })
             .collect();
+
+        tracing::debug!(
+            region_count = region_backends.len(),
+            base_regions = ranges.iter().filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Base)).count(),
+            delta_regions = ranges.iter().filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Delta)).count(),
+            "dual-backend region_backends built"
+        );
 
         // Set fields
         self.mem_snapshot_image_config_path =
@@ -2382,6 +2398,14 @@ impl FirecrackerSandbox {
                 && mem_image_config.lowers.len() > 1
                 && !mem_image_config.lowers[0].file.is_empty();
 
+            tracing::debug!(
+                enable_dual_backend,
+                has_base_template = mem_image_config.base_template.is_some(),
+                lowers_count = mem_image_config.lowers.len(),
+                dual_backend_eligible,
+                "dual-backend check"
+            );
+
             let (mem_device_path, _base_device, rbs) = if dual_backend_eligible {
                 match self
                     .setup_dual_backend(
@@ -2442,6 +2466,11 @@ impl FirecrackerSandbox {
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
         if let Some(ref rbs) = region_backends {
+            tracing::debug!(
+                region_count = rbs.len(),
+                mem_device_path = %mem_device_path.display(),
+                "loading snapshot with multi-backend (dual)"
+            );
             self.fc_instance
                 .load_snapshot_multi_backend(
                     &vm_state_src,
@@ -2453,6 +2482,10 @@ impl FirecrackerSandbox {
                 )
                 .await?;
         } else {
+            tracing::debug!(
+                mem_device_path = %mem_device_path.display(),
+                "loading snapshot with single backend"
+            );
             self.fc_instance
                 .load_snapshot_file(
                     &vm_state_src,

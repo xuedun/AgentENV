@@ -1349,13 +1349,11 @@ pub(super) async fn compute_file_offset_ranges(
     let delta_layers = &mem_image_config.lowers[base_layer_count..];
 
     // 1. Open each delta layer, load its index
-    let io_ring = overlaybd::transient_io_ring::shared_transient_io_ring();
     let mut delta_indexes = Vec::new();
     for layer in delta_layers {
         let path = std::path::Path::new(&layer.file);
         let local: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(path, io_ring.clone())
-                .await
+            LocalFile::open_ro(path)
                 .with_context(|| format!("open delta layer for index: {}", path.display()))?,
         );
         let tar_adapted = overlaybd::backend::tar::new_tar_file_adaptor(local)
@@ -1376,9 +1374,6 @@ pub(super) async fn compute_file_offset_ranges(
     let merged = overlaybd::index::ReadOnlyIndex::merge(&refs);
 
     // 3. Iterate through delta mappings, find gaps → base, align to 4KB, merge contiguous
-    // Small gaps between delta mappings are merged into delta to avoid exceeding
-    // the KVM slot limit (509). Only large gaps use the base device.
-    const MIN_BASE_GAP: u64 = 2 * 1024 * 1024; // 2 MiB
     let mut result = Vec::new();
     let mut cursor = 0u64;
 
@@ -1390,13 +1385,7 @@ pub(super) async fn compute_file_offset_ranges(
 
         if delta_start > cursor {
             let gap_size = delta_start - cursor;
-            if gap_size >= MIN_BASE_GAP {
-                // Large gap → base
-                push_or_merge(&mut result, cursor, gap_size, BackendKind::Base);
-            } else {
-                // Small gap → merge into delta to reduce range count
-                push_or_merge(&mut result, cursor, gap_size, BackendKind::Delta);
-            }
+            push_or_merge(&mut result, cursor, gap_size, BackendKind::Base);
         }
         if delta_end > delta_start {
             push_or_merge(&mut result, delta_start, delta_end - delta_start, BackendKind::Delta);

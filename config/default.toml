@@ -296,7 +296,7 @@ startup_prewarm = true
 
 [pool.firecracker]
 # Enable pre-spawned Firecracker processes for snapshot resume.
-enabled = true
+enabled = false
 # Populate the process pool during server startup.
 startup_prewarm = true
 # Maximum concurrent process creations in one refill batch.
