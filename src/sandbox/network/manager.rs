@@ -1314,9 +1314,7 @@ mod tests {
                 "child failed to observe allocated network namespace: {netns_id}"
             );
 
-            println!("SLOT_IDX={slot_idx}");
-            println!("NETNS_ID={netns_id}");
-            println!("HOST_INTERACTION_IP={}", slot.host_interaction_ip);
+            tracing::debug!(slot_idx = slot_idx, netns_id = %netns_id, host_interaction_ip = %slot.host_interaction_ip, "network slot created");
 
             manager
                 .release(slot)
