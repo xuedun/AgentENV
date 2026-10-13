@@ -1373,11 +1373,11 @@ impl FirecrackerSandbox {
         let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
         {
             let count = dirty_ranges.ranges.len();
-            let total_bytes: u64 = dirty_ranges.ranges.iter().map(|r| r.length).sum();
+            let total_bytes: i64 = dirty_ranges.ranges.iter().map(|r| r.length).sum();
             tracing::info!(
                 sandbox_id = %self.id,
                 dirty_ranges_count = count,
-                dirty_bytes = total_bytes,
+                dirty_bytes = total_bytes as u64,
                 "snapshot dirty memory ranges captured from Firecracker"
             );
         }
