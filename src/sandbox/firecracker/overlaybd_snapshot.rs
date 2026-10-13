@@ -1403,6 +1403,23 @@ pub(super) async fn compute_file_offset_ranges(
         );
     }
 
+    let base_count = result.iter().filter(|r| r.backend == BackendKind::Base).count();
+    let delta_count = result.iter().filter(|r| r.backend == BackendKind::Delta).count();
+    let base_bytes: u64 = result.iter().filter(|r| r.backend == BackendKind::Base).map(|r| r.size).sum();
+    let delta_bytes: u64 = result.iter().filter(|r| r.backend == BackendKind::Delta).map(|r| r.size).sum();
+    let total_covered: u64 = result.iter().map(|r| r.size).sum();
+    tracing::info!(
+        base_regions = base_count,
+        base_bytes = base_bytes,
+        delta_regions = delta_count,
+        delta_bytes = delta_bytes,
+        total_ranges = result.len(),
+        total_covered_bytes = total_covered,
+        mem_virtual_size = mem_virtual_size,
+        covered_eq_virtual = total_covered == mem_virtual_size,
+        "compute_file_offset_ranges result"
+    );
+
     Ok(result)
 }
 

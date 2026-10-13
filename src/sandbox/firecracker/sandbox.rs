@@ -1371,14 +1371,36 @@ impl FirecrackerSandbox {
         // error aborts this direct snapshot attempt and is propagated to
         // the lifecycle caller for recovery.
         let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-        convert_dirty_memory_to_overlaybd(
+        {
+            let count = dirty_ranges.ranges.len();
+            let total_bytes: u64 = dirty_ranges.ranges.iter().map(|r| r.length).sum();
+            tracing::info!(
+                sandbox_id = %self.id,
+                dirty_ranges_count = count,
+                dirty_bytes = total_bytes,
+                "snapshot dirty memory ranges captured from Firecracker"
+            );
+        }
+        let result = convert_dirty_memory_to_overlaybd(
             firecracker_pid,
             &dirty_ranges,
             &mem_overlaybd_dir,
             memory_output,
         )
         .await
-        .context("convert dirty memory ranges to overlaybd layer")
+        .context("convert dirty memory ranges to overlaybd layer")?;
+        {
+            let (layer_path, virtual_size) = &result;
+            let layer_size = std::fs::metadata(layer_path).map(|m| m.len()).unwrap_or(0);
+            tracing::info!(
+                sandbox_id = %self.id,
+                delta_layer_path = %layer_path.display(),
+                delta_layer_size = layer_size,
+                mem_virtual_size = *virtual_size,
+                "delta overlaybd layer written"
+            );
+        }
+        Ok(result)
     }
 
     /// Resume a paused sandbox in-place.
@@ -1631,11 +1653,14 @@ impl FirecrackerSandbox {
             .await
             .context("create or reuse delta memory ublk device")?;
 
-        tracing::debug!(
+        tracing::info!(
+            sandbox_id = %self.id,
             base_dev_path = %base_device.device_path().display(),
             delta_dev_path = %delta_device.device_path().display(),
             base_template_path = %base_template_path.display(),
-            base_layer_count,
+            base_layer_count = base_layer_count,
+            delta_layer_count = mem_image_config.lowers.len() - base_layer_count,
+            mem_virtual_size = config.mem_virtual_size,
             "dual-backend devices created/reused"
         );
 
@@ -1676,7 +1701,8 @@ impl FirecrackerSandbox {
             })
             .collect();
 
-        tracing::debug!(
+        tracing::info!(
+            sandbox_id = %self.id,
             region_count = region_backends.len(),
             base_regions = ranges.iter().filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Base)).count(),
             delta_regions = ranges.iter().filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Delta)).count(),

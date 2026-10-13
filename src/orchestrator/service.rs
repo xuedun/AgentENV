@@ -2495,6 +2495,11 @@ where
         };
         if let Err(source) = wait_result {
             warn!(error = %format_args!("{source:#}"), "sandbox failed to become ready");
+            tracing::error!(
+                sandbox_id = %sandbox_id,
+                error = %format_args!("{source:#}"),
+                "DUAL_BACKEND_DEBUG: WaitReady failed - check preceding dual-backend logs for this sandbox_id"
+            );
             self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
                 .await;
             return Err(OrchestratorError::SandboxOperationFailed {
