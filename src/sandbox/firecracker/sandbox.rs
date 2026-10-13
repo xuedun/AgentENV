@@ -1709,6 +1709,59 @@ impl FirecrackerSandbox {
             "dual-backend region_backends built"
         );
 
+        // Verify delta regions serve different data from base.
+        let delta_count_for_verify: usize = ranges
+            .iter()
+            .filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Delta))
+            .count();
+        let sample_count = 5.min(delta_count_for_verify);
+        let delta_regions: Vec<&super::overlaybd_snapshot::FileOffsetRange> = ranges
+            .iter()
+            .filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Delta))
+            .collect();
+        let mut mismatches = 0;
+        for r in delta_regions.iter().take(sample_count) {
+            let offset = r.file_offset as u64;
+            let size = std::cmp::min(r.size as usize, 4096);
+            let mut base_buf = vec![0u8; size];
+            let mut delta_buf = vec![0u8; size];
+            let base_ok = std::fs::File::open(&base_path)
+                .and_then(|mut f| {
+                    use std::io::{Read, Seek, SeekFrom};
+                    f.seek(SeekFrom::Start(offset))?;
+                    f.read_exact(&mut base_buf)
+                })
+                .is_ok();
+            let delta_ok = std::fs::File::open(&delta_path)
+                .and_then(|mut f| {
+                    use std::io::{Read, Seek, SeekFrom};
+                    f.seek(SeekFrom::Start(offset))?;
+                    f.read_exact(&mut delta_buf)
+                })
+                .is_ok();
+            if base_ok && delta_ok {
+                let same = base_buf == delta_buf;
+                if same {
+                    mismatches += 1;
+                }
+                tracing::info!(
+                    sandbox_id = %self.id,
+                    file_offset = offset,
+                    size = size,
+                    base_eq_delta = same,
+                    "delta verification sample"
+                );
+            }
+        }
+        if mismatches > 0 {
+            tracing::warn!(
+                sandbox_id = %self.id,
+                sample_count = sample_count,
+                mismatches = mismatches,
+                "DUAL_BACKEND_VERIFY: delta device returns same data as base for some delta regions — delta data may not be served correctly"
+            );
+        }
+
         // Set fields
         self.mem_snapshot_image_config_path =
             Some(config.mem_overlaybd_config.image_config_path.clone());
