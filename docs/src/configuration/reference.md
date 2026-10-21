@@ -403,6 +403,7 @@ Snapshot storage/build configuration.
 |-----|------|---------|-------------|
 | `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
 | `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
+| `pause_write_io` | string | `"buffered"` | IO mode for pause-time memory-layer writes (dirty-page capture and memory-layer compaction). `"buffered"` writes through the kernel page cache (fast; dirty pages accumulate until writeback); `"direct"` writes with O_DIRECT, bypassing the page cache entirely (slower pauses, near-zero dirty memory). Applies to memory layers only; rootfs layers stay buffered. |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:

@@ -348,6 +348,12 @@ pub struct SnapshotConfig {
     pub local_cache_path: PathBuf,
     #[config(default = "posix_fs")]
     pub repository_backend: SnapshotRepositoryBackendKind,
+    /// IO mode for pause-time memory layer writes (dirty-page capture and
+    /// memory layer compaction). "buffered" keeps the page cache fast path;
+    /// "direct" bypasses the page cache with O_DIRECT, accepting slower
+    /// pauses to keep dirty memory near zero.
+    #[config(default = "buffered")]
+    pub pause_write_io: PauseWriteIoKind,
     /// When true, snapshot artifacts are published to and fetched from the P2P
     /// transport after each commit. Has no effect unless `[p2p].enabled` is also true.
     #[config(default = true)]
@@ -462,6 +468,18 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+}
+
+/// Pause-time memory-layer write IO mode.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseWriteIoKind {
+    /// Writes go through the kernel page cache: fast, but dirty pages
+    /// accumulate until background writeback catches up.
+    Buffered,
+    /// Writes use O_DIRECT and bypass the page cache entirely: trades
+    /// throughput for near-zero dirty memory.
+    Direct,
 }
 
 #[derive(Debug, Config, Clone)]

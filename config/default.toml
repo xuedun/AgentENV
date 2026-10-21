@@ -27,7 +27,7 @@ virtualization_mode = "kvm"
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
 # binary_path = ""
-
+binary_path = "/home/cxd/firecracker/build/cargo_target/release/firecracker"
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.
 boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
@@ -43,11 +43,11 @@ socket_poll_ms = 1
 # Per-sandbox work directories contain sockets, local logs, and writable
 # OverlayBD upper layers. Serial logs persist separately by sandbox ID.
 # work_dir = "$AENV_HOME/firecracker-work"
-# serial_dir = "$AENV_HOME/logs/serial"
+serial_dir = "$AENV_HOME/logs/serial"
 
 # Enable Firecracker's own firecracker.log beside the serial log. Supported
 # levels are Error, Warning, Info, Debug, and Trace; unset disables it.
-# log_level = "Info"
+log_level = "Warning"
 
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
@@ -68,8 +68,8 @@ control_plane_port = 49983
 default_image = "ubuntu:24.04"
 
 # Registries tried, in order, when resolving short image names.
-search_registries = ["docker.io", "ghcr.io"]
-
+# search_registries = ["docker.io", "ghcr.io"]
+search_registries = ["localhost:5000"]
 # Convert standard OCI tar layers into local OverlayBD commits. Set false to
 # require OverlayBD-native images or referrers and fail fast otherwise.
 convert_standard_oci = true
@@ -212,6 +212,13 @@ auto_resume_min_sandbox_timeout_secs = 300
 # - "oss" stores snapshots in S3-compatible object storage.
 repository_backend = "posix_fs"
 
+# IO mode for pause-time memory layer writes:
+# - "buffered" writes through the kernel page cache (fast; dirty pages
+#   accumulate until writeback catches up).
+# - "direct" writes with O_DIRECT, bypassing the page cache entirely
+#   (slower pauses; near-zero dirty memory).
+pause_write_io = "direct"
+
 # EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
 # resolution. Effective only when [p2p].enabled is also true. POSIX fixed
 # artifacts remain authoritative in their repository.
@@ -282,7 +289,7 @@ p2p_fetch_range_timeout_ms = 2000
 # Shared idle-resource targets. Pools start low and grow their refill target
 # toward the high watermark as acquisitions drain them. Low must not exceed high.
 low_watermark = 2
-high_watermark = 64
+high_watermark = 4096
 
 [pool.network]
 # Refill the network-slot pool in the background.
@@ -315,7 +322,7 @@ track_dirty_pages = true
 # When true, sandboxes from the same base template share a base ublk device
 # (read-only), while each sandbox gets its own delta ublk device for dirty pages.
 # Set to false to use single-backend mode (original behavior).
-enable_dual_backend = true
+enable_dual_backend = false
 
 # Compress memory snapshot layers. The algorithm is parsed but ignored when
 # compression is disabled.

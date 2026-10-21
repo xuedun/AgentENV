@@ -102,6 +102,7 @@ pub(crate) async fn compact_layers(
     layers: &[LayerConfig],
     output_path: &Path,
     mode: OverlaybdCompactOutput,
+    direct_io: bool,
 ) -> Result<Option<PathBuf>> {
     if layers.is_empty() {
         return Ok(None);
@@ -127,8 +128,13 @@ pub(crate) async fn compact_layers(
 
     let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));
     let build_result: Result<()> = async {
-        let output_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(&lower_tmp).context("create compacted layer output file")?);
+        let output_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::builder()
+                .truncate(true)
+                .direct_io(direct_io)
+                .open(&lower_tmp)
+                .context("create compacted layer output file")?,
+        );
         let commit_args = create_commit_args(output_file, mode, 32).await?;
         merge_files_ro(&src_files, commit_args)
             .await
@@ -301,9 +307,9 @@ mod tests {
             ),
         ] {
             let output_path = temp.path().join(format!("compacted-{name}.commit"));
-            let published = compact_layers(&layers, &output_path, mode)
+            let published = compact_layers(&layers, &output_path, mode, false)
                 .await
-                .expect("compact mixed raw/lz4/zstd layers");
+                .expect("compact mixed raw/zstd layers");
             assert_eq!(published.as_deref(), Some(output_path.as_path()));
             assert!(!output_path.with_extension("commit.tmp").exists());
 
@@ -320,7 +326,7 @@ mod tests {
         std::fs::write(&bogus, vec![0xAB; 4096]).expect("write bogus layer");
         let mut broken = layers.clone();
         broken.push(layer_config(&bogus));
-        compact_layers(&broken, &output_path, OverlaybdCompactOutput::Raw)
+        compact_layers(&broken, &output_path, OverlaybdCompactOutput::Raw, false)
             .await
             .expect_err("invalid input layer must fail");
         assert_eq!(

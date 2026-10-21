@@ -396,7 +396,8 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
-        0, // rootfs: no base layer protection, original behavior
+        0,     // rootfs: no base layer protection, original behavior
+        false, // rootfs layers are tiny; pause_write_io applies to memory layers
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -417,6 +418,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     compaction_output_name: &'static str,
     compaction_output: OverlaybdCompactOutput,
     base_layer_count: usize,
+    direct_io: bool,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
@@ -426,6 +428,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         canonicalized_runtime_owned_roots(),
         compaction_output,
         base_layer_count,
+        direct_io,
     )
     .await
 }
@@ -438,6 +441,7 @@ async fn rewrite_lowers_with_runtime_roots(
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
     base_layer_count: usize,
+    direct_io: bool,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots, base_layer_count);
@@ -465,6 +469,7 @@ async fn rewrite_lowers_with_runtime_roots(
             &runtime_suffix,
             &output_dir.join(compaction_output_name),
             compaction_output,
+            direct_io,
         )
         .await?
         {
@@ -596,6 +601,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     memory_output: OverlaybdCompactOutput,
     base_template: Option<&str>,
     base_layer_count: usize,
+    direct_io: bool,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
@@ -607,6 +613,7 @@ pub(super) async fn build_mem_snapshot_image_config(
         "mem_compacted.commit",
         memory_output,
         base_layer_count,
+        direct_io,
     )
     .await?;
 
@@ -680,11 +687,15 @@ async fn publish_memory_overlaybd_layer(
     output_path: &Path,
     mode: OverlaybdCompactOutput,
     concurrency: usize,
+    direct_io: bool,
 ) -> Result<()> {
     let lower_tmp = output_path.with_extension("commit.tmp");
     let build_result = async {
         let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp)
+            LocalFile::builder()
+                .truncate(true)
+                .direct_io(direct_io)
+                .open(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
         let commit_args = create_commit_args(output_file, mode, concurrency).await?;
@@ -799,6 +810,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     dirty_ranges: &DirtyMemoryRanges,
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
+    direct_io: bool,
 ) -> Result<(PathBuf, u64)> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -806,6 +818,37 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
 
     let data_path = output_dir.join("overlaybd.commit");
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
+
+    // Log each dirty page's location and content read from guest memory
+    let reader = ProcessVmReader::new(firecracker_pid);
+    for range in &dirty_ranges.ranges {
+        let hva = u64::try_from(range.base_host_virt_addr).unwrap_or(0);
+        let img_off = u64::try_from(range.image_offset).unwrap_or(0);
+        let len = u64::try_from(range.length).unwrap_or(0);
+        let sample_len = std::cmp::min(len as usize, 32);
+        let mut content = vec![0u8; sample_len];
+        let read_ok = reader.read_at_into(hva, &mut content).await.is_ok();
+        if read_ok {
+            tracing::info!(
+                "AENV_DIRTY_PAGE: image_offset={} hva={} length={} first32={}",
+                img_off,
+                hva,
+                len,
+                content
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>(),
+            );
+        } else {
+            tracing::warn!(
+                "AENV_DIRTY_PAGE: image_offset={} hva={} length={} read_failed",
+                img_off,
+                hva,
+                len,
+            );
+        }
+    }
+
     let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
     let src_layers = vec![source_file];
     publish_memory_overlaybd_layer(
@@ -815,6 +858,7 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
         &data_path,
         mode,
         DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+        direct_io,
     )
     .await
     .context("compact dirty memory ranges as overlaybd layer")?;
@@ -1006,6 +1050,7 @@ mod tests {
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
             0,
+            false,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1071,6 +1116,8 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            0,
+            false,
         )
         .await
         .expect("rewrite with deep stable prefix");
@@ -1151,6 +1198,8 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            0,
+            false,
         )
         .await
         .expect("rewrite with shrinking budget");
@@ -1244,6 +1293,7 @@ mod tests {
             OverlaybdCompactOutput::Raw,
             None,
             0,
+            false,
         )
         .await
         .expect("build memory image config");
@@ -1302,6 +1352,7 @@ mod tests {
             &output,
             OverlaybdCompactOutput::Raw,
             1,
+            false,
         )
         .await
         .expect_err("copy failure should be returned");
@@ -1360,9 +1411,10 @@ pub(super) async fn compute_file_offset_ranges(
             .await
             .with_context(|| format!("adapt delta layer as tar file: {}", path.display()))?;
         let display = path.display().to_string();
-        let switched = overlaybd::backend::switch::new_switch_file(tar_adapted, true, Some(&display))
-            .await
-            .with_context(|| format!("open delta layer via switch file: {}", path.display()))?;
+        let switched =
+            overlaybd::backend::switch::new_switch_file(tar_adapted, true, Some(&display))
+                .await
+                .with_context(|| format!("open delta layer via switch file: {}", path.display()))?;
         let index = overlaybd::index_file::open_file_index(switched)
             .await
             .with_context(|| format!("load delta layer index: {}", path.display()))?;
@@ -1379,16 +1431,30 @@ pub(super) async fn compute_file_offset_ranges(
 
     for m in merged.mappings() {
         // Align delta range outward to 4KB boundaries
-        // (extra sectors become delta, which is safe since delta device has data)
-        let delta_start = (m.offset() * ALIGNMENT).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let delta_end = ((m.offset() as u64 + m.length() as u64) * ALIGNMENT) / PAGE_SIZE * PAGE_SIZE;
+        // (extra sectors become delta, which is safe since delta device has data).
+        // Inward rounding would drop the straddling page at every mapping
+        // boundary that is not 4KB-aligned to the base backend, silently
+        // reverting that page to base content and losing delta writes.
+        let mut delta_start = (m.offset() * ALIGNMENT) / PAGE_SIZE * PAGE_SIZE;
+        let delta_end =
+            ((m.offset() as u64 + m.length() as u64) * ALIGNMENT).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        // Outward rounding of adjacent mappings can overlap; clamp to the
+        // cursor so regions stay contiguous without duplication.
+        if delta_start < cursor {
+            delta_start = cursor;
+        }
 
         if delta_start > cursor {
             let gap_size = delta_start - cursor;
             push_or_merge(&mut result, cursor, gap_size, BackendKind::Base);
         }
         if delta_end > delta_start {
-            push_or_merge(&mut result, delta_start, delta_end - delta_start, BackendKind::Delta);
+            push_or_merge(
+                &mut result,
+                delta_start,
+                delta_end - delta_start,
+                BackendKind::Delta,
+            );
         }
         cursor = cursor.max(delta_end);
     }
@@ -1403,10 +1469,24 @@ pub(super) async fn compute_file_offset_ranges(
         );
     }
 
-    let base_count = result.iter().filter(|r| r.backend == BackendKind::Base).count();
-    let delta_count = result.iter().filter(|r| r.backend == BackendKind::Delta).count();
-    let base_bytes: u64 = result.iter().filter(|r| r.backend == BackendKind::Base).map(|r| r.size).sum();
-    let delta_bytes: u64 = result.iter().filter(|r| r.backend == BackendKind::Delta).map(|r| r.size).sum();
+    let base_count = result
+        .iter()
+        .filter(|r| r.backend == BackendKind::Base)
+        .count();
+    let delta_count = result
+        .iter()
+        .filter(|r| r.backend == BackendKind::Delta)
+        .count();
+    let base_bytes: u64 = result
+        .iter()
+        .filter(|r| r.backend == BackendKind::Base)
+        .map(|r| r.size)
+        .sum();
+    let delta_bytes: u64 = result
+        .iter()
+        .filter(|r| r.backend == BackendKind::Delta)
+        .map(|r| r.size)
+        .sum();
     let total_covered: u64 = result.iter().map(|r| r.size).sum();
     tracing::info!(
         base_regions = base_count,

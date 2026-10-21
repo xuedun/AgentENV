@@ -110,15 +110,14 @@ pub(crate) async fn prepare_layer_upload(
         file: source.display().to_string(),
         ..LayerConfig::default()
     };
-    let Some(recontainerized_path) =
-        compact_layers(&[layer], temp.path(), mode)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(
-                    format!("recontainerize layer '{}' as zfile", source.display()),
-                    e,
-                )
-            })?
+    let Some(recontainerized_path) = compact_layers(&[layer], temp.path(), mode, false)
+        .await
+        .map_err(|e| {
+            RepositoryError::backend(
+                format!("recontainerize layer '{}' as zfile", source.display()),
+                e,
+            )
+        })?
     else {
         // A single input layer always produces output; fall back to the
         // original bytes if the compactor ever reports no data.

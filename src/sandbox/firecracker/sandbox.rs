@@ -1198,10 +1198,19 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
+        // Pause-time memory-layer writes honor [snapshot].pause_write_io:
+        // "direct" bypasses the page cache at a throughput cost.
+        let pause_direct_io = ConfigManager::global_config().snapshot.pause_write_io
+            == crate::cfg::PauseWriteIoKind::Direct;
         // Local layers are always captured raw; when enabled, compression
         // happens once at publish time under `[snapshot.publish_compression]`.
         let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
+            .snapshot_memory_to_overlaybd(
+                &vm_state_path,
+                snapshot_dir,
+                OverlaybdCompactOutput::Raw,
+                pause_direct_io,
+            )
             .await?;
 
         // Build the memory image config: collect parent layers, make runtime
@@ -1219,10 +1228,7 @@ impl FirecrackerSandbox {
         let base_template_for_snapshot: Option<String> = self
             .base_template
             .clone()
-            .or_else(|| {
-                resume_mem_image_config_path
-                    .map(|p| p.to_string_lossy().into_owned())
-            });
+            .or_else(|| resume_mem_image_config_path.map(|p| p.to_string_lossy().into_owned()));
         let mem_image_config = build_mem_snapshot_image_config(
             resume_mem_image_config_path,
             &mem_layer_path,
@@ -1230,6 +1236,7 @@ impl FirecrackerSandbox {
             OverlaybdCompactOutput::Raw,
             base_template_for_snapshot.as_deref(),
             self.base_layer_count.unwrap_or(0),
+            pause_direct_io,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -1361,6 +1368,7 @@ impl FirecrackerSandbox {
         vm_state_path: &Path,
         snapshot_dir: &Path,
         memory_output: OverlaybdCompactOutput,
+        direct_io: bool,
     ) -> Result<(PathBuf, u64)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
         let firecracker_pid = self.fc_instance.pid()?;
@@ -1386,6 +1394,7 @@ impl FirecrackerSandbox {
             &dirty_ranges,
             &mem_overlaybd_dir,
             memory_output,
+            direct_io,
         )
         .await
         .context("convert dirty memory ranges to overlaybd layer")?;
@@ -1399,6 +1408,59 @@ impl FirecrackerSandbox {
                 mem_virtual_size = *virtual_size,
                 "delta overlaybd layer written"
             );
+
+            // PAUSE_VERIFY: read dirty pages from guest memory (proc/pid/mem)
+            // and compare with base layer data at same image_offset.
+            // If guest data == base data, the delta layer will store identical
+            // bytes — not a bug, just KVM tracked a page the guest wrote back
+            // unchanged.  Log how many dirty pages happen to match base so we
+            // can correlate with resume-time DUAL_BACKEND_VERIFY mismatches.
+            if let Some(base_dev) = self.mem_base_ublk_device.as_ref() {
+                let base_path = base_dev.device_path().to_path_buf();
+                let pid_raw = firecracker_pid.as_raw();
+                let mut same_as_base = 0usize;
+                let mut total_checked = 0usize;
+                let mut match_offsets: Vec<(u64, usize)> = Vec::new();
+                for range in &dirty_ranges.ranges {
+                    let img_off = u64::try_from(range.image_offset).unwrap_or(0);
+                    let len = u64::try_from(range.length).unwrap_or(0);
+                    let hva = u64::try_from(range.base_host_virt_addr).unwrap_or(0);
+                    let check_len = std::cmp::min(len as usize, 4096);
+                    let mut guest_buf = vec![0u8; check_len];
+                    let guest_ok = std::fs::File::open(format!("/proc/{}/mem", pid_raw))
+                        .and_then(|mut f| {
+                            use std::io::{Read, Seek, SeekFrom};
+                            f.seek(SeekFrom::Start(hva))?;
+                            f.read_exact(&mut guest_buf)
+                        })
+                        .is_ok();
+                    let mut base_buf = vec![0u8; check_len];
+                    let base_ok = std::fs::File::open(&base_path)
+                        .and_then(|mut f| {
+                            use std::io::{Read, Seek, SeekFrom};
+                            f.seek(SeekFrom::Start(img_off))?;
+                            f.read_exact(&mut base_buf)
+                        })
+                        .is_ok();
+                    if guest_ok && base_ok {
+                        total_checked += 1;
+                        if guest_buf == base_buf {
+                            same_as_base += 1;
+                            if match_offsets.len() < 20 {
+                                match_offsets.push((img_off, check_len));
+                            }
+                        }
+                    }
+                }
+                tracing::info!(
+                    sandbox_id = %self.id,
+                    total_dirty_ranges = dirty_ranges.ranges.len(),
+                    checked = total_checked,
+                    same_as_base = same_as_base,
+                    match_offsets = ?match_offsets,
+                    "PAUSE_VERIFY: dirty pages that match base (guest wrote unchanged data)"
+                );
+            }
         }
         Ok(result)
     }
@@ -1709,18 +1771,16 @@ impl FirecrackerSandbox {
             "dual-backend region_backends built"
         );
 
-        // Verify delta regions serve different data from base.
-        let delta_count_for_verify: usize = ranges
-            .iter()
-            .filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Delta))
-            .count();
-        let sample_count = 5.min(delta_count_for_verify);
+        // Verify delta regions serve different data from base (full scan).
         let delta_regions: Vec<&super::overlaybd_snapshot::FileOffsetRange> = ranges
             .iter()
             .filter(|r| matches!(r.backend, super::overlaybd_snapshot::BackendKind::Delta))
             .collect();
+        let total_delta_regions = delta_regions.len();
         let mut mismatches = 0;
-        for r in delta_regions.iter().take(sample_count) {
+        let mut match_offsets: Vec<(u64, usize)> = Vec::new();
+        let mut checked = 0;
+        for r in delta_regions.iter() {
             let offset = r.file_offset as u64;
             let size = std::cmp::min(r.size as usize, 4096);
             let mut base_buf = vec![0u8; size];
@@ -1740,24 +1800,45 @@ impl FirecrackerSandbox {
                 })
                 .is_ok();
             if base_ok && delta_ok {
+                checked += 1;
                 let same = base_buf == delta_buf;
                 if same {
                     mismatches += 1;
+                    if match_offsets.len() < 20 {
+                        match_offsets.push((offset, size));
+                    }
                 }
+                // Log each delta region's content for comparison with pause-time
+                // AENV_DIRTY_PAGE entries. Limit hex dump to 32 bytes.
+                let delta_hex: String = delta_buf[..std::cmp::min(32, delta_buf.len())]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
                 tracing::info!(
                     sandbox_id = %self.id,
-                    file_offset = offset,
-                    size = size,
+                    image_offset = offset,
+                    length = r.size,
                     base_eq_delta = same,
-                    "delta verification sample"
+                    delta_first32 = %delta_hex,
+                    "AENV_RESUME_DELTA_PAGE"
                 );
             }
         }
+        tracing::info!(
+            sandbox_id = %self.id,
+            total_delta_regions = total_delta_regions,
+            checked = checked,
+            mismatches = mismatches,
+            match_offsets = ?match_offsets,
+            "DUAL_BACKEND_VERIFY: full delta scan complete"
+        );
         if mismatches > 0 {
-            tracing::warn!(
+            tracing::error!(
                 sandbox_id = %self.id,
-                sample_count = sample_count,
+                total_delta_regions = total_delta_regions,
+                checked = checked,
                 mismatches = mismatches,
+                match_offsets = ?match_offsets,
                 "DUAL_BACKEND_VERIFY: delta device returns same data as base for some delta regions — delta data may not be served correctly"
             );
         }
@@ -1770,7 +1851,11 @@ impl FirecrackerSandbox {
         self.base_template = mem_image_config.base_template.clone();
         self.base_layer_count = Some(base_layer_count);
 
-        Ok((delta_path, self.mem_base_ublk_device.clone(), Some(region_backends)))
+        Ok((
+            delta_path,
+            self.mem_base_ublk_device.clone(),
+            Some(region_backends),
+        ))
     }
 
     /// Fallback to single-backend mode: create only delta device, no region_backends.
@@ -2404,7 +2489,8 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .overlaybd_global_config_path
             .clone();
-        let mut region_backends: Option<Vec<firecracker_client::models::RegionBackendConfig>> = None;
+        let mut region_backends: Option<Vec<firecracker_client::models::RegionBackendConfig>> =
+            None;
         let mem_device_path = if config.pack_recording {
             // Pack-recording VMs get a dedicated, non-shared memory device:
             // sharing one (or the block-device page cache behind it) would
@@ -2501,11 +2587,13 @@ impl FirecrackerSandbox {
                             error = %e,
                             "dual-backend setup failed, falling back to single backend"
                         );
-                        self.fallback_single_backend(&config, &mem_global_config).await?
+                        self.fallback_single_backend(&config, &mem_global_config)
+                            .await?
                     }
                 }
             } else {
-                self.fallback_single_backend(&config, &mem_global_config).await?
+                self.fallback_single_backend(&config, &mem_global_config)
+                    .await?
             };
             region_backends = rbs;
 
@@ -3535,7 +3623,6 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
             pack_recording: false,
-            memory_startup_pack: None,
         });
 
         assert_eq!(
@@ -3623,7 +3710,6 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
             pack_recording: false,
-            memory_startup_pack: None,
         })?;
         let common = value["common"]
             .as_object_mut()
