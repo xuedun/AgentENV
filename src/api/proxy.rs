@@ -748,7 +748,13 @@ async fn resolve_proxy_request(
                 return Err(ProxyRequestError::SandboxUnavailable(sandbox_id, state))
             }
             Ok(ProxyLookupResult::RouteMissing) => {
-                return Err(ProxyRequestError::MissingRuntimeRoute(sandbox_id))
+                // The sandbox is Running but its proxy route hasn't been
+                // published yet (e.g., resume just completed but
+                // upsert_proxy_route hasn't run, or the write lock is
+                // contended by concurrent resume operations). Wait briefly
+                // and retry before returning an error.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
             }
             Err(OrchestratorError::SandboxNotFound(_)) => {
                 return Err(ProxyRequestError::SandboxNotFound(sandbox_id))

@@ -2498,10 +2498,12 @@ where
             tracing::error!(
                 sandbox_id = %sandbox_id,
                 error = %format_args!("{source:#}"),
-                "DUAL_BACKEND_DEBUG: WaitReady failed - check preceding dual-backend logs for this sandbox_id"
+                "DUAL_BACKEND_DEBUG: WaitReady failed - keeping FC process alive for diagnosis"
             );
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
+            tracing::error!(
+                sandbox_id = %sandbox_id,
+                "DIAG_HOLD: FC process kept alive indefinitely — inspect now: ps, nsenter, gdb"
+            );
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation: SandboxOperation::WaitReady,

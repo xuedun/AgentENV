@@ -124,10 +124,25 @@ impl EnvdInstance {
             "waiting for envd"
         );
         let start = std::time::Instant::now();
+        let mut health_first_ok: Option<std::time::Instant> = None;
+        let mut health_ok_count: u64 = 0;
+        let mut health_err_count: u64 = 0;
+        let mut last_health_err: Option<String> = None;
 
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
+                tracing::warn!(
+                    base_path = %self.config.base_path,
+                    elapsed_ms = elapsed.as_millis(),
+                    health_ok_count,
+                    health_err_count,
+                    first_health_ok_after_ms = health_first_ok
+                        .map(|t| t.duration_since(start).as_millis() as i64)
+                        .unwrap_or(-1),
+                    last_health_err = last_health_err.as_deref().unwrap_or("none"),
+                    "timed out waiting for envd"
+                );
                 return Err(anyhow!("timed out waiting for envd"));
             }
 
@@ -135,13 +150,24 @@ impl EnvdInstance {
             let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
+                    health_ok_count += 1;
+                    if health_first_ok.is_none() {
+                        health_first_ok = Some(std::time::Instant::now());
+                    }
                     debug!(base_path = %self.config.base_path, "envd started successfully");
                     return Ok(());
                 }
                 Ok(Err(error)) => {
+                    health_err_count += 1;
+                    last_health_err = Some(format!("{error:#}"));
                     trace!(%error, "envd health probe failed");
                 }
                 Err(_) => {
+                    health_err_count += 1;
+                    last_health_err = Some(format!(
+                        "probe timed out after {}ms",
+                        probe_timeout.as_millis()
+                    ));
                     trace!(
                         timeout_ms = probe_timeout.as_millis(),
                         "envd health probe timed out"
@@ -151,6 +177,14 @@ impl EnvdInstance {
 
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
+                tracing::warn!(
+                    base_path = %self.config.base_path,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    health_ok_count,
+                    health_err_count,
+                    last_health_err = last_health_err.as_deref().unwrap_or("none"),
+                    "timed out waiting for envd"
+                );
                 return Err(anyhow!("timed out waiting for envd"));
             }
             sleep(std::cmp::min(retry_interval, remaining)).await;

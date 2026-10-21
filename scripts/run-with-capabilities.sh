@@ -58,6 +58,17 @@ fi
 
 run_group="$(id -gn "$run_user")"
 run_uid="$(id -u "$run_user")"
+
+# The daemon runs as the runtime user but inherits HOME from the launching
+# root session (sudo/systemd-run reset it to /root), which the runtime user
+# cannot read. Tools spawned by the daemon (regctl per-host TLS settings,
+# Docker credential lookups) resolve per-user config from HOME, so point it
+# at the runtime user's own home directory.
+run_home="$(getent passwd "$run_user" | cut -d: -f6 || true)"
+if [[ -n "$run_home" && -d "$run_home" ]]; then
+    export HOME="$run_home"
+fi
+
 if [[ "$run_uid" == "0" && -z "$root_warning" ]]; then
     root_warning="the selected account ${run_user} resolves to UID 0"
 fi
