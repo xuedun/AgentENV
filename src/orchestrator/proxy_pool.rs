@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::cfg::{ConfigManager, ProxyConfig};
 use crate::image::{ImageResolver, ResolvedBlockImage};
@@ -90,19 +90,32 @@ pub fn is_proxy_sandbox(metadata: &SandboxMetadata) -> bool {
 /// Prefers restoring from the proxy template; falls back to a cold start and
 /// publishes the running proxy as the new template. Stale proxy sandboxes
 /// from previous runs are swept first so restarts never accumulate proxy
-/// records. Errors are reported to the caller (the server logs them and
-/// keeps serving; proxy-read callers degrade to direct execution).
+/// records.
+///
+/// Test-mode policy: every unexpected failure (unreadable template, slot
+/// registration failure, template publish failure) is fatal — the server
+/// terminates with a loud log instead of silently serving without a proxy.
 pub async fn init_proxy_pool(
     orchestrator: Arc<Orchestrator>,
     image_resolver: Arc<ImageResolver>,
     snapshot_manager: Arc<SnapshotManager>,
 ) -> Result<()> {
+    use super::proxy_binding::{proxy_fatal, ProxySpawner};
+
     let proxy_config = ConfigManager::global_config().proxy.clone();
     if !proxy_config.enabled {
         return Ok(());
     }
 
     sweep_stale_proxy_sandboxes(&orchestrator).await;
+
+    // Install the on-demand spawner first so pause hooks arriving while the
+    // first proxy cold-starts can scale the pool out once it is ready.
+    let spawner: Arc<dyn ProxySpawner> = Arc::new(ProxyPoolSpawner {
+        orchestrator: Arc::clone(&orchestrator),
+        snapshot_manager: Arc::clone(&snapshot_manager),
+    });
+    orchestrator.proxy_bindings().begin_pool_init(spawner).await;
 
     info!(
         image = %proxy_config.image,
@@ -113,105 +126,186 @@ pub async fn init_proxy_pool(
     let alias = proxy_template_alias(&proxy_config)?;
 
     // Preferred path: restore from the template committed by a previous run.
+    // A *missing* template (first ever boot) legitimately cold-starts; an
+    // *unreadable* one is fatal in test mode.
     match snapshot_manager.load_runnable(alias.as_ref()).await {
         Ok(Some(snapshot)) => {
-            match create_proxy_from_template(&orchestrator, snapshot, &proxy_config).await {
-                Ok(metadata) => {
-                    match orchestrator.register_proxy_sandbox(metadata.id).await {
-                        Ok(slots) => info!(
-                            sandbox_id = %metadata.id,
-                            alias = %alias,
-                            slots,
-                            "resident proxy sandbox started from template"
-                        ),
-                        Err(err) => error!(
-                            sandbox_id = %metadata.id,
-                            alias = %alias,
-                            error = %format_args!("{err:#}"),
-                            "proxy sandbox started but its slots could not be registered; proxy reads will report the proxy as unavailable"
-                        ),
-                    }
-                    return Ok(());
-                }
-                Err(err) => warn!(
-                    error = %format_args!("{err:#}"),
-                    alias = %alias,
-                    "failed to start proxy sandbox from template; falling back to cold start"
-                ),
+            let metadata = create_proxy_from_template(&orchestrator, snapshot, &proxy_config)
+                .await
+                .unwrap_or_else(|err| {
+                    proxy_fatal(
+                        "failed to start proxy sandbox from template",
+                        format_args!("alias={alias}: {err:#}"),
+                    )
+                });
+            let slots = orchestrator
+                .register_proxy_sandbox(metadata.id)
+                .await
+                .unwrap_or_else(|err| {
+                    proxy_fatal(
+                        "proxy sandbox slots could not be registered",
+                        format_args!("sandbox {}: {err:#}", metadata.id),
+                    )
+                });
+            if slots == 0 {
+                proxy_fatal(
+                    "proxy sandbox registered zero slots",
+                    format_args!(
+                        "sandbox {} started from template {} but exposes no deferred slot drives",
+                        metadata.id, alias
+                    ),
+                );
             }
+            info!(
+                sandbox_id = %metadata.id,
+                alias = %alias,
+                slots,
+                "resident proxy sandbox started from template"
+            );
+            orchestrator.proxy_bindings().mark_ready();
+            return Ok(());
         }
         Ok(None) => {}
         Err(err) => {
-            warn!(
-                error = %format_args!("{err:#}"),
-                alias = %alias,
-                "failed to load proxy template; deleting it and falling back to cold start"
+            proxy_fatal(
+                "failed to load proxy template",
+                format_args!("alias={alias}: {err:#}"),
             );
-            // Best effort: drop the unreadable template record so the publish
-            // below can rebind the alias instead of hitting AliasConflict.
-            if let Err(delete_err) = snapshot_manager.delete(alias.as_ref()).await {
-                warn!(
-                    error = %format_args!("{delete_err:#}"),
-                    alias = %alias,
-                    "failed to delete unreadable proxy template"
-                );
-            }
         }
     }
 
-    // Fallback path: cold start, then capture the running proxy as the
+    // First-boot path: cold start, then capture the running proxy as the
     // template for subsequent boots.
     let request = build_proxy_launch_request(&proxy_config, image_resolver.as_ref()).await?;
     let metadata = orchestrator
         .create_sandbox(request)
         .await
         .context("create proxy sandbox")?;
-    match orchestrator.register_proxy_sandbox(metadata.id).await {
-        Ok(slots) => info!(
-            sandbox_id = %metadata.id,
-            slots,
-            "resident proxy sandbox started via cold start"
-        ),
-        Err(err) => error!(
-            sandbox_id = %metadata.id,
-            error = %format_args!("{err:#}"),
-            "proxy sandbox started but its slots could not be registered; proxy reads will report the proxy as unavailable"
-        ),
-    }
-
-    if let Err(err) =
-        publish_proxy_template(&orchestrator, &snapshot_manager, metadata.id, alias.clone()).await
-    {
-        // The proxy itself is running and registered; only future fast restarts
-        // are affected, so this stays a warning rather than a startup failure.
-        warn!(
-            sandbox_id = %metadata.id,
-            alias = %alias,
-            error = %format_args!("{err:#}"),
-            "failed to publish proxy template; the next server start cold-starts again"
+    let slots = orchestrator
+        .register_proxy_sandbox(metadata.id)
+        .await
+        .unwrap_or_else(|err| {
+            proxy_fatal(
+                "proxy sandbox slots could not be registered",
+                format_args!("sandbox {}: {err:#}", metadata.id),
+            )
+        });
+    if slots == 0 {
+        proxy_fatal(
+            "proxy sandbox registered zero slots",
+            format_args!(
+                "sandbox {} cold-started but exposes no deferred slot drives",
+                metadata.id
+            ),
         );
     }
+    info!(
+        sandbox_id = %metadata.id,
+        slots,
+        "resident proxy sandbox started via cold start"
+    );
+    orchestrator.proxy_bindings().mark_ready();
+
+    publish_proxy_template(&orchestrator, &snapshot_manager, metadata.id, alias.clone())
+        .await
+        .unwrap_or_else(|err| {
+            proxy_fatal(
+                "failed to publish proxy template",
+                format_args!("sandbox {} alias={alias}: {err:#}", metadata.id),
+            )
+        });
     Ok(())
+}
+
+/// On-demand proxy spawner: creates one more resident proxy sandbox from the
+/// template and registers its slots.
+struct ProxyPoolSpawner {
+    orchestrator: Arc<Orchestrator>,
+    snapshot_manager: Arc<SnapshotManager>,
+}
+
+#[async_trait::async_trait]
+impl super::proxy_binding::ProxySpawner for ProxyPoolSpawner {
+    async fn spawn_proxy(&self) -> Result<crate::types::SandboxId> {
+        use super::proxy_binding::proxy_fatal;
+
+        let proxy_config = ConfigManager::global_config().proxy.clone();
+        let alias = proxy_template_alias(&proxy_config)?;
+
+        let metadata = match self.snapshot_manager.load_runnable(alias.as_ref()).await {
+            Ok(Some(snapshot)) => {
+                create_proxy_from_template(&self.orchestrator, snapshot, &proxy_config)
+                    .await
+                    .unwrap_or_else(|err| {
+                        proxy_fatal(
+                            "on-demand proxy: failed to start from template",
+                            format_args!("alias={alias}: {err:#}"),
+                        )
+                    })
+            }
+            Ok(None) => {
+                // The template is published right after the first cold start;
+                // reaching here means publish failed or races init — fatal.
+                proxy_fatal(
+                    "on-demand proxy: no template to spawn from",
+                    format_args!(
+                        "proxy template {alias} is missing; init_proxy_pool should have published it"
+                    ),
+                );
+            }
+            Err(err) => {
+                proxy_fatal(
+                    "on-demand proxy: failed to load template",
+                    format_args!("alias={alias}: {err:#}"),
+                );
+            }
+        };
+
+        let slots = self
+            .orchestrator
+            .register_proxy_sandbox(metadata.id)
+            .await
+            .unwrap_or_else(|err| {
+                proxy_fatal(
+                    "on-demand proxy: slots could not be registered",
+                    format_args!("sandbox {}: {err:#}", metadata.id),
+                )
+            });
+        if slots == 0 {
+            proxy_fatal(
+                "on-demand proxy registered zero slots",
+                format_args!("sandbox {} exposes no deferred slot drives", metadata.id),
+            );
+        }
+        info!(
+            sandbox_id = %metadata.id,
+            slots,
+            "additional resident proxy sandbox spawned and registered"
+        );
+        Ok(metadata.id)
+    }
 }
 
 /// Delete every sandbox marked as a proxy. The proxy is disposable
 /// infrastructure: it is restored from its template (or cold-started when
 /// the template is missing) on every server start, so lingering records
 /// only waste disk space.
+///
+/// Test-mode policy: a failed sweep leaves stale proxies that would hold
+/// slots and shadow the freshly registered pool, so it is fatal.
 async fn sweep_stale_proxy_sandboxes(orchestrator: &Arc<Orchestrator>) {
+    use super::proxy_binding::proxy_fatal;
+
     let stale = match orchestrator.list_sandboxes().await {
         Ok(list) => list
             .into_iter()
             .filter(is_proxy_sandbox)
             .map(|metadata| metadata.id)
             .collect::<Vec<_>>(),
-        Err(err) => {
-            warn!(
-                error = %format_args!("{err:#}"),
-                "failed to list sandboxes while sweeping stale proxy sandboxes"
-            );
-            return;
-        }
+        Err(err) => proxy_fatal(
+            "failed to list sandboxes while sweeping stale proxy sandboxes",
+            format_args!("{err:#}"),
+        ),
     };
     for sandbox_id in stale {
         // A proxy has no volume mounts, so deletion goes straight through
@@ -219,10 +313,9 @@ async fn sweep_stale_proxy_sandboxes(orchestrator: &Arc<Orchestrator>) {
         match orchestrator.delete_sandbox(sandbox_id).await {
             Ok(()) => info!(sandbox_id = %sandbox_id, "swept stale proxy sandbox"),
             Err(OrchestratorError::SandboxNotFound(_)) => {}
-            Err(err) => warn!(
-                sandbox_id = %sandbox_id,
-                error = %format_args!("{err:#}"),
-                "failed to sweep stale proxy sandbox"
+            Err(err) => proxy_fatal(
+                "failed to sweep stale proxy sandbox",
+                format_args!("sandbox {sandbox_id}: {err:#}"),
             ),
         }
     }
@@ -278,15 +371,14 @@ async fn publish_proxy_template(
             );
             Ok(())
         }
-        // A readable record already owns the alias (e.g. the template path
-        // failed for a transient reason and the old template is still fine).
-        // Keep it; the next boot retries the template path.
+        // The cold-start publish runs only when the alias was free, so a
+        // conflict here means something else bound it concurrently — a
+        // silent "keep the other template" would mask that in test mode.
         Err(RepositoryError::AliasConflict { .. }) => {
-            warn!(
-                alias = %alias,
-                "proxy template alias already bound; keeping the existing template"
+            super::proxy_binding::proxy_fatal(
+                "proxy template alias conflict during publish",
+                format_args!("alias {alias} was bound by another record while publishing"),
             );
-            Ok(())
         }
         Err(err) => Err(anyhow::Error::new(err)).context("publish proxy template"),
     }

@@ -28,11 +28,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
@@ -318,10 +319,12 @@ pub(crate) struct PauseHookBinding {
 pub(crate) enum PauseHookSkip {
     /// The target is being torn down.
     Cancelled,
-    /// No free slot exists on any registered proxy.
+    /// No free slot exists on any registered proxy and no spawner is installed.
     NoFreeSlot,
     /// No proxy sandbox is registered (proxy disabled or still starting).
     NoProxy,
+    /// All proxies were full and spawning an additional one failed.
+    SpawnFailed(anyhow::Error),
 }
 
 impl std::fmt::Display for PauseHookSkip {
@@ -330,19 +333,70 @@ impl std::fmt::Display for PauseHookSkip {
             Self::Cancelled => f.write_str("target is being torn down"),
             Self::NoFreeSlot => f.write_str("no free proxy slot"),
             Self::NoProxy => f.write_str("no proxy sandbox registered"),
+            Self::SpawnFailed(err) => write!(f, "spawning an additional proxy failed: {err:#}"),
         }
     }
+}
+
+/// Creates an additional resident proxy sandbox on demand.
+///
+/// Installed by `init_proxy_pool` once the orchestrator exists. When every
+/// registered proxy is out of free slots, the pause hook calls this to scale
+/// the pool out by one proxy instead of refusing the binding.
+#[async_trait::async_trait]
+pub(crate) trait ProxySpawner: Send + Sync + 'static {
+    async fn spawn_proxy(&self) -> Result<SandboxId>;
 }
 
 /// Orchestrator-owned proxy binding registry.
 ///
 /// In-memory only: after a server restart the table is empty, so paused targets
 /// report a missing binding until their next pause re-binds them.
+///
+/// The registry is multi-proxy: `proxies` maps every resident proxy sandbox to
+/// its slot inventory, and each `BindingEntry` records the `proxy_id` serving
+/// its target, so reads always route to the proxy that owns the binding. When
+/// every registered proxy is full and a [`ProxySpawner`] is installed, the
+/// pause hook scales the pool out by one proxy and retries the allocation.
 #[derive(Default)]
 pub(crate) struct ProxyBindingTable {
     targets: DashMap<SandboxId, Arc<BindingEntry>>,
     proxies: DashMap<SandboxId, Arc<ProxyNode>>,
+    /// On-demand proxy factory (installed by `init_proxy_pool`).
+    spawner: RwLock<Option<Arc<dyn ProxySpawner>>>,
+    /// Serializes on-demand spawns so concurrent pauses add one proxy, not N.
+    spawn_lock: Mutex<()>,
+    /// Pool lifecycle phase. `Idle` means this orchestrator never engaged the
+    /// proxy pool (proxy disabled, or a test/tool process): pause hooks skip
+    /// binding entirely. `Initializing`/`Ready` engage the fatal-on-failure
+    /// test policy.
+    phase: AtomicU8,
+    phase_notify: Notify,
 }
+
+const PHASE_IDLE: u8 = 0;
+const PHASE_INITIALIZING: u8 = 1;
+const PHASE_READY: u8 = 2;
+
+/// Test-environment policy for the proxy subsystem: any failure that would
+/// otherwise silently degrade proxy reads terminates the server loudly so the
+/// fault is unmistakable in logs and CI.
+pub(crate) fn proxy_fatal(context: &str, detail: impl std::fmt::Display) -> ! {
+    tracing::error!(
+        %context,
+        error = %detail,
+        "PROXY FATAL: terminating server (silent degradation is disabled in test mode)"
+    );
+    std::process::exit(1);
+}
+
+/// Bounded wait for `init_proxy_pool` to register the first proxy. Init
+/// failures terminate the process, so this is a safety net rather than a
+/// normal path.
+const PROXY_POOL_READY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Maximum on-demand spawn attempts for a single pause hook.
+const MAX_SPAWN_ATTEMPTS: usize = 8;
 
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync + 'static>() {}
@@ -350,6 +404,7 @@ const _: fn() = || {
     assert_send_sync::<BindingEntry>();
     assert_send_sync::<ProxyNode>();
     assert_send_sync::<ProxyExecutor>();
+    assert_send_sync::<Arc<dyn ProxySpawner>>();
 };
 
 impl ProxyBindingTable {
@@ -403,6 +458,84 @@ impl ProxyBindingTable {
         self.targets.len()
     }
 
+    /// Install the on-demand proxy factory and move the pool to
+    /// `Initializing`: pause hooks from now on wait for readiness (and fail
+    /// loudly if the pool never comes up) instead of skipping.
+    pub(crate) async fn begin_pool_init(&self, spawner: Arc<dyn ProxySpawner>) {
+        let mut guard = self.spawner.write().await;
+        *guard = Some(spawner);
+        self.phase
+            .store(PHASE_INITIALIZING, std::sync::atomic::Ordering::Release);
+        self.phase_notify.notify_waiters();
+    }
+
+    /// Mark the pool as usable and wake every `wait_until_ready` waiter.
+    pub(crate) fn mark_ready(&self) {
+        self.phase
+            .store(PHASE_READY, std::sync::atomic::Ordering::Release);
+        self.phase_notify.notify_waiters();
+    }
+
+    /// Pool lifecycle phase (see [`PHASE_*`] constants).
+    fn phase(&self) -> u8 {
+        self.phase.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this orchestrator owns a proxy pool at all. `Idle` means the
+    /// pool was never engaged (proxy disabled, or a test/tool process), so
+    /// pause hooks skip binding entirely rather than waiting or failing.
+    pub(crate) fn pool_engaged(&self) -> bool {
+        self.phase() != PHASE_IDLE
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.phase() == PHASE_READY
+    }
+
+    /// Wait until the resident proxy pool finished its first registration.
+    ///
+    /// Called by the pause hook while the pool is initializing, so a target
+    /// pausing during the proxy cold start waits for the pool instead of
+    /// silently skipping its binding. The bound is a safety net only: init
+    /// failures exit the process, so the pool either becomes ready or the
+    /// server dies.
+    pub(crate) async fn wait_until_ready(&self) -> Result<()> {
+        if self.is_ready() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + PROXY_POOL_READY_TIMEOUT;
+        loop {
+            if self.is_ready() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "resident proxy pool did not become ready within {:?}",
+                    PROXY_POOL_READY_TIMEOUT
+                );
+            }
+            tokio::select! {
+                _ = self.phase_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        }
+    }
+
+    /// Whether any registered proxy still has a free slot (non-consuming).
+    async fn has_free_slot(&self) -> bool {
+        let proxy_ids: Vec<SandboxId> = self.proxies.iter().map(|item| *item.key()).collect();
+        for proxy_id in proxy_ids {
+            let Some(node) = self.proxies.get(&proxy_id).map(|item| Arc::clone(&item)) else {
+                continue;
+            };
+            let free = node.free.lock().await;
+            if !free.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Look up a target's binding entry.
     fn get(&self, target: &SandboxId) -> Option<Arc<BindingEntry>> {
         self.targets.get(target).map(|item| Arc::clone(&item))
@@ -413,6 +546,10 @@ impl ProxyBindingTable {
     ///
     /// Cheap and non-blocking (no device or guest work); the caller then spawns
     /// the asynchronous bind. Pause itself never fails because of this.
+    ///
+    /// When every registered proxy is out of free slots, the installed
+    /// [`ProxySpawner`] adds one more proxy sandbox and the allocation is
+    /// retried (bounded by [`MAX_SPAWN_ATTEMPTS`]).
     pub(crate) async fn record_pause_generation(
         &self,
         target: SandboxId,
@@ -430,13 +567,72 @@ impl ProxyBindingTable {
             return Ok(PauseHookBinding { entry, generation });
         }
 
-        let Some((proxy_id, node, slot_index)) = self.allocate_slot().await else {
-            return Err(if self.proxies.is_empty() {
-                PauseHookSkip::NoProxy
-            } else {
-                PauseHookSkip::NoFreeSlot
-            });
-        };
+        let mut last_spawn_error: Option<anyhow::Error> = None;
+        for attempt in 0..=MAX_SPAWN_ATTEMPTS {
+            if let Some((proxy_id, node, slot_index)) = self.allocate_slot().await {
+                return self
+                    .finish_first_pause_allocation(target, proxy_id, node, slot_index)
+                    .await;
+            }
+            if self.proxies.is_empty() {
+                return Err(PauseHookSkip::NoProxy);
+            }
+            // Every proxy is full: scale the pool out (unless there is no
+            // spawner, e.g. the proxy feature was started without a pool).
+            let spawner = {
+                let guard = self.spawner.read().await;
+                guard.clone()
+            };
+            let Some(spawner) = spawner else {
+                return Err(PauseHookSkip::NoFreeSlot);
+            };
+            if attempt == MAX_SPAWN_ATTEMPTS {
+                break;
+            }
+            // Serialize spawns: concurrent full-table pauses share one new
+            // proxy and each retries `allocate_slot` afterwards.
+            let _spawn_guard = self.spawn_lock.lock().await;
+            // Re-check under the lock: another pauser may have just spawned.
+            // Non-consuming check — `allocate_slot` pops a slot, so calling it
+            // here would leak it when the loop retries.
+            if self.has_free_slot().await {
+                continue;
+            }
+            info!(
+                target = %target,
+                proxies = self.proxies.len(),
+                attempt,
+                "all proxy slots are occupied; spawning an additional proxy sandbox"
+            );
+            match spawner.spawn_proxy().await {
+                Ok(proxy_id) => {
+                    info!(
+                        target = %target,
+                        proxy_id = %proxy_id,
+                        proxies = self.proxies.len(),
+                        "additional proxy sandbox registered"
+                    );
+                }
+                Err(err) => {
+                    last_spawn_error = Some(err);
+                    break;
+                }
+            }
+        }
+        match last_spawn_error {
+            Some(err) => Err(PauseHookSkip::SpawnFailed(err)),
+            None => Err(PauseHookSkip::NoFreeSlot),
+        }
+    }
+
+    /// Finish the first-pause allocation by inserting the binding entry.
+    async fn finish_first_pause_allocation(
+        &self,
+        target: SandboxId,
+        proxy_id: SandboxId,
+        node: Arc<ProxyNode>,
+        slot_index: usize,
+    ) -> Result<PauseHookBinding, PauseHookSkip> {
         let slot_dev_id = node.slot_dev_ids[slot_index];
         let entry = Arc::new(BindingEntry {
             target,
@@ -819,7 +1015,17 @@ async fn run_bind(
                 "proxy_bind_failed"
             );
             let mut state = Arc::clone(&entry.state).write_owned().await;
-            state.status = BindingStatus::Failed(reason);
+            state.status = BindingStatus::Failed(reason.clone());
+            drop(state);
+            // Test-mode policy: a failed bind would leave the target silently
+            // unreadable (reads return 503 forever), so terminate loudly.
+            proxy_fatal(
+                "proxy bind failed",
+                format_args!(
+                    "target {target} proxy {} slot {} generation {generation} (first_bind={first_bind}): {reason}",
+                    entry.proxy_id, entry.slot_index
+                ),
+            );
         }
     }
 }
@@ -1103,12 +1309,17 @@ async fn drain_inflight(entry: Arc<BindingEntry>) {
     let deadline = Instant::now() + DRAIN_TIMEOUT;
     while entry.inflight.load(Ordering::Acquire) > 0 {
         if Instant::now() >= deadline {
-            warn!(
-                target = %entry.target,
-                inflight = entry.inflight.load(Ordering::Acquire),
-                "timed out draining in-flight proxy commands before rebind"
+            // Proceeding would swap the slot's stack under a still-running
+            // command: fatal in test mode instead of silently corrupting it.
+            proxy_fatal(
+                "timed out draining in-flight proxy commands before rebind",
+                format_args!(
+                    "target {} still has {} in-flight command(s) after {:?}",
+                    entry.target,
+                    entry.inflight.load(Ordering::Acquire),
+                    DRAIN_TIMEOUT
+                ),
             );
-            return;
         }
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }

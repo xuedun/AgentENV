@@ -1539,10 +1539,44 @@ where
             );
             return;
         }
+        // Gate on the resident pool lifecycle rather than the config flag:
+        // the config can say `enabled` in a process that never engaged the
+        // pool (unit tests, tools), while `begin_pool_init` is the single
+        // signal that this orchestrator owns a proxy pool.
+        if !self.proxy_bindings.pool_engaged() {
+            return;
+        }
+        // While init_proxy_pool has not registered its first proxy yet (cold
+        // start can take minutes for image conversion), pausing targets must
+        // wait instead of silently skipping the binding.
+        if let Err(err) = self.proxy_bindings.wait_until_ready().await {
+            super::proxy_binding::proxy_fatal(
+                "proxy pool never became ready",
+                format_args!("{err:#}"),
+            );
+        }
+        // The proxy sandbox itself never binds: it is not a read target.
+        // (is_proxy_sandbox gates on user_metadata, which only proxies carry.)
+        if let Ok(Some(metadata)) = self.store.get(&sandbox_id).await {
+            if super::proxy_pool::is_proxy_sandbox(&metadata) {
+                debug!(
+                    sandbox_id = %sandbox_id,
+                    "skipping proxy binding for a proxy sandbox"
+                );
+                return;
+            }
+        }
 
         let Some(rootfs_config) = paused_state.rootfs_image_config() else {
-            debug!(sandbox_id = %sandbox_id, "paused sandbox has no overlaybd rootfs; skipping proxy binding");
-            return;
+            // Every sandbox on this deployment is overlaybd-backed; a paused
+            // target without an overlaybd rootfs cannot be proxied and must
+            // not silently stay unreadable in test mode.
+            super::proxy_binding::proxy_fatal(
+                "paused sandbox has no overlaybd rootfs",
+                format_args!(
+                    "sandbox {sandbox_id} paused without an overlaybd rootfs image config"
+                ),
+            );
         };
 
         let binding = match self
@@ -1551,19 +1585,23 @@ where
             .await
         {
             Ok(binding) => binding,
-            Err(PauseHookSkip::NoProxy) => {
-                debug!(sandbox_id = %sandbox_id, "no proxy sandbox registered; skipping proxy binding");
-                return;
-            }
-            Err(skip) => {
-                // A full slot table is an operational condition, not a bug: the
-                // target simply stays unreadable through the proxy and its next
-                // pause retries.
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    reason = %skip,
-                    "proxy_bind_skipped"
-                );
+            Err(PauseHookSkip::NoProxy) => super::proxy_binding::proxy_fatal(
+                "no proxy sandbox registered",
+                format_args!("target {sandbox_id} paused but the resident proxy pool is empty"),
+            ),
+            Err(PauseHookSkip::NoFreeSlot) => super::proxy_binding::proxy_fatal(
+                "proxy slot pool exhausted",
+                format_args!(
+                    "target {sandbox_id} paused but no proxy has a free slot and \
+                     no on-demand spawner is installed"
+                ),
+            ),
+            Err(PauseHookSkip::SpawnFailed(err)) => super::proxy_binding::proxy_fatal(
+                "on-demand proxy spawn failed",
+                format_args!("target {sandbox_id}: {err:#}"),
+            ),
+            Err(PauseHookSkip::Cancelled) => {
+                debug!(sandbox_id = %sandbox_id, "target cancelled; skipping proxy binding");
                 return;
             }
         };
@@ -1651,6 +1689,12 @@ where
         self.proxy_bindings.binding_count()
     }
 
+    /// Access the proxy binding registry (used by `init_proxy_pool` to install
+    /// the on-demand spawner and mark the pool ready).
+    pub(crate) fn proxy_bindings(&self) -> &Arc<ProxyBindingTable> {
+        &self.proxy_bindings
+    }
+
     /// Build a resolver that fetches the proxy sandbox's executor on demand.
     ///
     /// Resolved per use rather than captured: the proxy handle can be replaced
@@ -1709,7 +1753,12 @@ where
             .await
             .map_err(|err| {
                 error!(sandbox_id = %sandbox_id, error = %err, "proxy_read_store_failed");
-                ProxyReadFailure::BindingMissing
+                // Test-mode policy: the metadata store is in-memory and its
+                // failure is an internal inconsistency, not a client error.
+                super::proxy_binding::proxy_fatal(
+                    "proxy-read metadata store failed",
+                    format_args!("sandbox {sandbox_id}: {err}"),
+                )
             })?
             .ok_or(ProxyReadFailure::TargetNotFound)?;
 
@@ -1730,6 +1779,22 @@ where
             Some(entry) => entry,
             None => {
                 let total = bindings.binding_count();
+                if bindings.pool_engaged() {
+                    // With the pool engaged, every paused target is bound by
+                    // its pause hook (which waits for readiness and fails the
+                    // process on slot/spawn errors). A missing binding here
+                    // means an internal inconsistency (e.g. the entry was
+                    // dropped by a proxy unregister) — terminate loudly in
+                    // test mode instead of returning 500 forever.
+                    super::proxy_binding::proxy_fatal(
+                        "paused sandbox has no proxy binding",
+                        format_args!(
+                            "sandbox {sandbox_id} is Paused but its binding is missing \
+                             (registered bindings: {total}); a proxy may have been \
+                             unregistered while targets were still bound"
+                        ),
+                    );
+                }
                 error!(
                     sandbox_id = %sandbox_id,
                     bindings = total,
@@ -1744,13 +1809,13 @@ where
             Ok(executor) => executor,
             Err(err) => {
                 let message = format!("{err:#}");
-                error!(
-                    sandbox_id = %sandbox_id,
-                    proxy_id = %proxy_id,
-                    error = %message,
-                    "proxy_unavailable"
+                // The proxy sandbox is registered but its executor cannot be
+                // resolved: it died or vanished underneath the binding table.
+                // Test-mode policy: fail loudly rather than serve 503 forever.
+                super::proxy_binding::proxy_fatal(
+                    "proxy sandbox executor unavailable",
+                    format_args!("sandbox {sandbox_id} proxy {proxy_id}: {message}"),
                 );
-                return Err(ProxyReadFailure::ProxyUnavailable(message));
             }
         };
 
