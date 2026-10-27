@@ -49,6 +49,18 @@ socket_poll_ms = 1
 # levels are Error, Warning, Info, Debug, and Trace; unset disables it.
 # log_level = "Info"
 
+# Leaf cgroup count; all Firecracker processes are spread across them
+# round-robin. 144 = six shards per CCL on 24-CCL hosts (Kunpeng 950).
+cgroup_pool_size = 144
+
+# Bind each pooled shard to one hardware domain via cpuset, written once at
+# pool creation. "ccl" (default) pins a shard's CPUs to one CCL (the kernel
+# cluster / L3 domain, 8 cores on Kunpeng 950) and its memory to the
+# containing node; it applies on arm64 hosts with cluster topology and
+# leaves shards unbound elsewhere. "numa" pins CPUs and memory to one NUMA
+# node; "none" leaves shards unbound.
+cgroup_cpuset_topology = "ccl"
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.

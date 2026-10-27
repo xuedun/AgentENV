@@ -3,7 +3,7 @@ mod backend;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
-mod firecracker;
+pub(crate) mod firecracker;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;

@@ -48,6 +48,8 @@ Firecracker VM binary and boot configuration.
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker serial output (per-sandbox subdirectories) |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). When set to a non-empty value, Firecracker's own logging is enabled and written to a `firecracker.log` file in each sandbox's log directory (alongside the serial output). Empty/unset disables it |
+| `cgroup_pool_size` | integer | `144` | Fixed count of shared cgroup shard leaves under `/sys/fs/cgroup/aenv`; all Firecracker processes spread across them round-robin, and nothing is created or removed at runtime. `0` disables per-sandbox memcg isolation. 144 = six shards per CCL on 24-CCL hosts |
+| `cgroup_cpuset_topology` | string | `ccl` | Hardware domain each pooled Firecracker cgroup shard is bound to via cpuset, written once at leaf-pool creation: `ccl` pins each shard's CPUs to one CCL (the kernel's cluster topology, the L3 domain on arm64 Kunpeng) and its memory allocations to the containing node, and applies only on arm64 hosts with cluster topology — elsewhere shards stay unbound; `numa` pins CPUs and memory allocations to one NUMA node; `none` leaves shards unbound and resets masks a previous run wrote. Detection or write failures degrade to unbound shards |
 
 ## `[kernel]`
 

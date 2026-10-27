@@ -22,6 +22,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, trace, warn};
 
+use super::cgroup;
 use super::mmds::MmdsMetadata;
 use super::socket::UnixSocketClient;
 
@@ -156,6 +157,13 @@ impl FirecrackerInstance {
             if let Err(e) = fs::write(&oom_path, b"1000") {
                 warn!(pid, oom_path, err = %e, "failed to set oom_score_adj for firecracker");
             }
+
+            // Moving the process into a shared cgroup shard charges its memory
+            // (guest RAM, page cache) to that shard alone, so the reclaim and
+            // writeback churn of pausing/resuming one sandbox lands on its shard
+            // mates instead of every co-located sandbox. The leaf outlives the
+            // process; nothing to undo here.
+            cgroup::attach(pid);
         }
 
         self.process = Some(child);

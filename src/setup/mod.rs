@@ -1,3 +1,4 @@
+mod cgroup;
 mod deps;
 mod kvm;
 mod network_capacity;
@@ -51,6 +52,12 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
         );
     }
     ublk::provision(runtime_group)?;
+    if let Err(err) = cgroup::provision(runtime_gid) {
+        warn!(
+            error = %err,
+            "per-firecracker memcg isolation is unavailable; firecracker processes stay in the root memcg"
+        );
+    }
     overlaybd::install_system_default_config(&config.deps_path, runtime_gid)?;
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").context("enable host IPv4 forwarding")?;
@@ -124,18 +131,26 @@ pub async fn ensure_environment(
     info!("checking ublk module and permissions");
     ublk::check()?;
 
-    // 4. Download dependencies and generate overlaybd runtime configs.
+    // 4. Per-firecracker memcg base: privileged servers self-provision here;
+    //    unprivileged ones rely on `server --setup-host` having run. The leaf
+    //    pool is created once, sized and topology-bound by config.
+    cgroup::ensure_runtime_base(
+        config.firecracker.cgroup_pool_size,
+        config.firecracker.cgroup_cpuset_topology,
+    );
+
+    // 5. Download dependencies and generate overlaybd runtime configs.
     ensure_dependencies(config).await?;
     deps::write_generated_overlaybd_global_configs(config, p2p_facade_address)?;
 
-    // 5. set nofile limit to a relative large value
+    // 6. set nofile limit to a relative large value
     let (soft_limit, hard_limit) = getrlimit(Resource::RLIMIT_NOFILE).context("get rlimit")?;
     if soft_limit < 65536 {
         setrlimit(Resource::RLIMIT_NOFILE, 65536.min(hard_limit), hard_limit)
             .context("set rlimit")?;
     }
 
-    // 6. Host networking is provisioned separately and only validated here.
+    // 7. Host networking is provisioned separately and only validated here.
     let ip_forward = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
         .context("read host IPv4 forwarding setting")?;
     if ip_forward.trim() != "1" {

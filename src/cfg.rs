@@ -161,6 +161,21 @@ pub struct PosixFsBackendConfig {
     pub snapshot_store: PathBuf,
 }
 
+/// Hardware domain each pooled Firecracker cgroup shard is pinned to via
+/// cpuset. `ccl` (the default) pins a shard's CPUs to one kernel cluster -
+/// the CCL / L3 domain on arm64 Kunpeng - and its memory allocations to
+/// the NUMA node containing that cluster; on other architectures, or when
+/// the platform exposes no cluster topology, shards stay unbound. `numa`
+/// pins CPUs and memory allocations to one NUMA node; `none` leaves every
+/// shard unbound.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpusetTopology {
+    None,
+    Numa,
+    Ccl,
+}
+
 #[derive(Debug, Clone, Config)]
 pub struct FirecrackerConfig {
     pub binary_path: Option<PathBuf>,
@@ -185,6 +200,15 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), Firecracker logging is enabled and written to a
     /// `firecracker.log` file in the same directory as the Firecracker stdout log.
     pub log_level: Option<String>,
+    /// Leaf cgroup count; all Firecracker processes are spread across them
+    /// round-robin. 144 is six shards per CCL on 24-CCL hosts (Kunpeng 950).
+    #[config(default = 144usize)]
+    pub cgroup_pool_size: usize,
+    /// Defaults to `ccl`: each pooled shard is bound to one CCL, falling
+    /// back to unbound shards on platforms without any; masks are written
+    /// once at leaf-pool creation. See [`CpusetTopology`].
+    #[config(default = "ccl")]
+    pub cgroup_cpuset_topology: CpusetTopology,
 }
 
 #[derive(Debug, Config, Clone)]
