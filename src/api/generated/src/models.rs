@@ -151,6 +151,12 @@ pub struct SandboxesSandboxIdPausePostPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdProxyReadPostPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesSandboxIdRefreshesPostPathParams {
     pub sandbox_id: String,
 }
@@ -4543,6 +4549,556 @@ impl std::str::FromStr for OrderDirection {
             "asc" => std::result::Result::Ok(OrderDirection::Asc),
             "desc" => std::result::Result::Ok(OrderDirection::Desc),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ProxyReadError {
+    /// Machine-readable error tag: target_not_found, target_not_paused, output_not_utf8, proxy_binding_missing, proxy_unavailable, rebind_in_progress, rebind_failed. The server logs the same string so client and server logs can be correlated.
+    #[serde(rename = "code")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub code: String,
+
+    /// Human-readable detail.
+    #[serde(rename = "message")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub message: String,
+}
+
+impl ProxyReadError {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(code: String, message: String) -> ProxyReadError {
+        ProxyReadError { code, message }
+    }
+}
+
+/// Converts the ProxyReadError value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ProxyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("code".to_string()),
+            Some(self.code.to_string()),
+            Some("message".to_string()),
+            Some(self.message.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ProxyReadError value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ProxyReadError {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub code: Vec<String>,
+            pub message: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ProxyReadError".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "code" => intermediate_rep.code.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "message" => intermediate_rep.message.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ProxyReadError".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ProxyReadError {
+            code: intermediate_rep
+                .code
+                .into_iter()
+                .next()
+                .ok_or_else(|| "code missing in ProxyReadError".to_string())?,
+            message: intermediate_rep
+                .message
+                .into_iter()
+                .next()
+                .ok_or_else(|| "message missing in ProxyReadError".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ProxyReadError> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ProxyReadError>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ProxyReadError>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ProxyReadError - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ProxyReadError> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ProxyReadError as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ProxyReadError - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ProxyReadRequest {
+    /// Shell command to execute against the paused sandbox's rootfs. The command runs inside the resident proxy sandbox via chroot into the target's filesystem, so absolute paths and the target image's own binaries resolve exactly as they would inside the sandbox. Read-only commands that do not depend on environment variables are the supported scope.
+    #[serde(rename = "command")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub command: String,
+
+    /// Working directory inside the target sandbox's filesystem. Defaults to the target's recorded workdir, then to \"/\".
+    #[serde(rename = "cwd")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+
+    /// Additional environment variables for this call. Highest priority in the three-layer merge (image ENV, sandbox env_vars, request envs).
+    #[serde(rename = "envs")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envs: Option<std::collections::HashMap<String, String>>,
+
+    /// Execution timeout in seconds. Defaults to 30.
+    #[serde(rename = "timeoutSecs")]
+    #[validate(range(min = 1u32, max = 300u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u32>,
+}
+
+impl ProxyReadRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(command: String) -> ProxyReadRequest {
+        ProxyReadRequest {
+            command,
+            cwd: None,
+            envs: None,
+            timeout_secs: None,
+        }
+    }
+}
+
+/// Converts the ProxyReadRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ProxyReadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("command".to_string()),
+            Some(self.command.to_string()),
+            self.cwd
+                .as_ref()
+                .map(|cwd| ["cwd".to_string(), cwd.to_string()].join(",")),
+            // Skipping envs in query parameter serialization
+            self.timeout_secs.as_ref().map(|timeout_secs| {
+                ["timeoutSecs".to_string(), timeout_secs.to_string()].join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ProxyReadRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ProxyReadRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub command: Vec<String>,
+            pub cwd: Vec<String>,
+            pub envs: Vec<std::collections::HashMap<String, String>>,
+            pub timeout_secs: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ProxyReadRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "command" => intermediate_rep.command.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "cwd" => intermediate_rep.cwd.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "envs" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in ProxyReadRequest"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timeoutSecs" => intermediate_rep.timeout_secs.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ProxyReadRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ProxyReadRequest {
+            command: intermediate_rep
+                .command
+                .into_iter()
+                .next()
+                .ok_or_else(|| "command missing in ProxyReadRequest".to_string())?,
+            cwd: intermediate_rep.cwd.into_iter().next(),
+            envs: intermediate_rep.envs.into_iter().next(),
+            timeout_secs: intermediate_rep.timeout_secs.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ProxyReadRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ProxyReadRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ProxyReadRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ProxyReadRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ProxyReadRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ProxyReadRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ProxyReadRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ProxyReadResponse {
+    /// Exit code of the command inside the proxy sandbox.
+    #[serde(rename = "exitCode")]
+    pub exit_code: i32,
+
+    /// Captured standard output (up to 10 MiB).
+    #[serde(rename = "stdout")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub stdout: String,
+
+    /// Captured standard error (up to 10 MiB).
+    #[serde(rename = "stderr")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub stderr: String,
+
+    /// Command execution duration in milliseconds.
+    #[serde(rename = "durationMs")]
+    pub duration_ms: i64,
+
+    /// Pause generation of the rootfs view the command ran against. Observability only; the view always matches the target's latest pause when the call succeeds.
+    #[serde(rename = "bindingGeneration")]
+    pub binding_generation: i64,
+}
+
+impl ProxyReadResponse {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        duration_ms: i64,
+        binding_generation: i64,
+    ) -> ProxyReadResponse {
+        ProxyReadResponse {
+            exit_code,
+            stdout,
+            stderr,
+            duration_ms,
+            binding_generation,
+        }
+    }
+}
+
+/// Converts the ProxyReadResponse value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ProxyReadResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("exitCode".to_string()),
+            Some(self.exit_code.to_string()),
+            Some("stdout".to_string()),
+            Some(self.stdout.to_string()),
+            Some("stderr".to_string()),
+            Some(self.stderr.to_string()),
+            Some("durationMs".to_string()),
+            Some(self.duration_ms.to_string()),
+            Some("bindingGeneration".to_string()),
+            Some(self.binding_generation.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ProxyReadResponse value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ProxyReadResponse {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub exit_code: Vec<i32>,
+            pub stdout: Vec<String>,
+            pub stderr: Vec<String>,
+            pub duration_ms: Vec<i64>,
+            pub binding_generation: Vec<i64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ProxyReadResponse".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "exitCode" => intermediate_rep.exit_code.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "stdout" => intermediate_rep.stdout.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "stderr" => intermediate_rep.stderr.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "durationMs" => intermediate_rep.duration_ms.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "bindingGeneration" => intermediate_rep.binding_generation.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ProxyReadResponse".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ProxyReadResponse {
+            exit_code: intermediate_rep
+                .exit_code
+                .into_iter()
+                .next()
+                .ok_or_else(|| "exitCode missing in ProxyReadResponse".to_string())?,
+            stdout: intermediate_rep
+                .stdout
+                .into_iter()
+                .next()
+                .ok_or_else(|| "stdout missing in ProxyReadResponse".to_string())?,
+            stderr: intermediate_rep
+                .stderr
+                .into_iter()
+                .next()
+                .ok_or_else(|| "stderr missing in ProxyReadResponse".to_string())?,
+            duration_ms: intermediate_rep
+                .duration_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "durationMs missing in ProxyReadResponse".to_string())?,
+            binding_generation: intermediate_rep
+                .binding_generation
+                .into_iter()
+                .next()
+                .ok_or_else(|| "bindingGeneration missing in ProxyReadResponse".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ProxyReadResponse> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ProxyReadResponse>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ProxyReadResponse>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ProxyReadResponse - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ProxyReadResponse> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ProxyReadResponse as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ProxyReadResponse - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
         }
     }
 }

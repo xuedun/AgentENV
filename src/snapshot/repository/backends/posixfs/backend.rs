@@ -731,6 +731,7 @@ mod tests {
                     sub_path: None,
                     snapshot_output_dir: None,
                     volume: false,
+                    defer_mount: false,
                 },
                 ExtraDrive::Overlaybd {
                     drive_id: "data".to_string(),
@@ -741,6 +742,7 @@ mod tests {
                     sub_path: None,
                     snapshot_output_dir: None,
                     volume: false,
+                    defer_mount: false,
                 },
             ],
         );

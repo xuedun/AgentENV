@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::cfg::ConfigManager;
 use crate::image::cache::{
@@ -30,6 +30,10 @@ use super::metrics::{
 };
 use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
+use super::proxy_binding::{
+    spawn_bind, PauseHookSkip, ProxyBindRequest, ProxyBindingTable, ProxyExecutor,
+    ProxyReadCommand, ProxyReadFailure, ProxyReadOutput,
+};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
@@ -97,7 +101,7 @@ pub struct Orchestrator<
     store: S,
     factory: F,
     persister: P,
-    sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
+    sandboxes: Arc<RwLock<HashMap<SandboxId, SandboxHandle>>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -109,6 +113,8 @@ pub struct Orchestrator<
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     volume_manager: Option<Arc<VolumeManager>>,
+    /// Proxy sandbox binding registry (paused target rootfs -> proxy slot).
+    proxy_bindings: Arc<ProxyBindingTable>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -213,7 +219,7 @@ where
             store,
             factory,
             persister,
-            sandboxes: RwLock::new(HashMap::new()),
+            sandboxes: Arc::new(RwLock::new(HashMap::new())),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -225,6 +231,7 @@ where
             image_refs,
             access_tokens,
             volume_manager,
+            proxy_bindings: Arc::new(ProxyBindingTable::default()),
         });
 
         // Start the auto-evict task.
@@ -1210,6 +1217,13 @@ where
             }
         }
 
+        // Proxy teardown (read-path design §3.2.5): release this sandbox's
+        // proxy binding — or, when it *is* the proxy, drop every binding it
+        // held. This must complete before paused artifacts are removed below:
+        // the bound slot still references the target's layer files, so
+        // deleting them first would leave the slot serving freed storage.
+        self.teardown_proxy_binding(sandbox_id).await?;
+
         // Now the sandbox is successfully stopped, remove its metadata.
         let metadata = self.store.remove(&sandbox_id).await?;
         if let Some(metadata) = metadata {
@@ -1496,7 +1510,256 @@ where
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
 
+        self.schedule_proxy_bind_after_pause(sandbox_id, paused_state.as_ref())
+            .await;
+
         Ok(())
+    }
+
+    /// Pause-completion hook for the proxy read path (design §3.2.9).
+    ///
+    /// The synchronous segment only records the new pause generation and
+    /// reserves a slot, so pause latency is unaffected; the device creation,
+    /// slot adoption and guest mount run on a background task. Until that task
+    /// finishes, `proxy-read` reports `rebind_in_progress` rather than serving
+    /// the previous generation.
+    ///
+    /// Skipped while shutting down: the shutdown pass pauses business sandboxes
+    /// and deletes proxies in one sweep, so a binding started here would only
+    /// be torn down again.
+    async fn schedule_proxy_bind_after_pause(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        paused_state: &dyn PausedSandboxState,
+    ) {
+        if self.is_shutting_down() {
+            debug!(
+                sandbox_id = %sandbox_id,
+                "skipping proxy binding during shutdown"
+            );
+            return;
+        }
+
+        let Some(rootfs_config) = paused_state.rootfs_image_config() else {
+            debug!(sandbox_id = %sandbox_id, "paused sandbox has no overlaybd rootfs; skipping proxy binding");
+            return;
+        };
+
+        let binding = match self
+            .proxy_bindings
+            .record_pause_generation(sandbox_id)
+            .await
+        {
+            Ok(binding) => binding,
+            Err(PauseHookSkip::NoProxy) => {
+                debug!(sandbox_id = %sandbox_id, "no proxy sandbox registered; skipping proxy binding");
+                return;
+            }
+            Err(skip) => {
+                // A full slot table is an operational condition, not a bug: the
+                // target simply stays unreadable through the proxy and its next
+                // pause retries.
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    reason = %skip,
+                    "proxy_bind_skipped"
+                );
+                return;
+            }
+        };
+
+        let request = ProxyBindRequest {
+            image_config_path: rootfs_config.image_config_path.clone(),
+            runtime_upper_mode: rootfs_config.runtime_upper_mode,
+            env_vars: paused_state.env_vars(),
+            workdir: paused_state.workdir(),
+        };
+        let generation = binding.generation;
+        let entry = binding.entry;
+        let executor = self.proxy_executor_resolver(entry.proxy_id());
+
+        debug!(
+            target = %sandbox_id,
+            generation,
+            "proxy binding task started"
+        );
+        spawn_bind(entry, request, executor);
+    }
+
+    /// Register a running proxy sandbox so its deferred slot drives become
+    /// allocatable for target bindings.
+    ///
+    /// Slot dev_ids are read from the backend in attach order, which is the
+    /// same order the guest numbered them (`vdc`, `vdd`, ...), so slot index
+    /// and guest device letter stay in lockstep.
+    pub async fn register_proxy_sandbox(&self, sandbox_id: SandboxId) -> Result<usize> {
+        let slots = {
+            let table = self.sandboxes.read().await;
+            let handle = table
+                .get(&sandbox_id)
+                .cloned()
+                .context("proxy sandbox handle is missing")?;
+            let sandbox = handle.lock().await;
+            sandbox.deferred_drive_dev_ids()
+        };
+        let dev_ids: Vec<u32> = slots.iter().map(|(_, dev_id)| *dev_id).collect();
+        let count = dev_ids.len();
+        self.proxy_bindings.register_proxy(sandbox_id, dev_ids);
+        Ok(count)
+    }
+
+    /// Unregister a proxy sandbox, dropping every binding it held.
+    pub fn unregister_proxy_sandbox(&self, sandbox_id: SandboxId) {
+        self.proxy_bindings.unregister_proxy(sandbox_id);
+    }
+
+    /// Release the proxy-side state owned by `sandbox_id` during teardown.
+    ///
+    /// Covers both roles: a target sandbox loses its slot binding (UNBIND), and
+    /// the proxy sandbox itself is unregistered, which invalidates every
+    /// binding it held. Errors propagate so delete does not proceed to artifact
+    /// cleanup while a slot may still reference those files.
+    async fn teardown_proxy_binding(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        if self.proxy_bindings.is_proxy(&sandbox_id) {
+            self.unregister_proxy_sandbox(sandbox_id);
+            return Ok(());
+        }
+
+        let Some(entry) = self.proxy_bindings.proxy_entry(&sandbox_id) else {
+            // Never paused (or paused before the proxy existed): nothing bound.
+            return Ok(());
+        };
+        let proxy_id = entry.proxy_id();
+        let executor = self.proxy_executor_resolver(proxy_id);
+        let bindings = Arc::clone(&self.proxy_bindings);
+        // Drains in-flight proxied commands and runs guest `umount`, so it uses
+        // the same blocking-thread isolation as the binding tasks.
+        let handle = tokio::runtime::Handle::current();
+        let unbind = tokio::task::spawn_blocking(move || {
+            handle.block_on(bindings.unbind_target(sandbox_id, executor))
+        })
+        .await
+        .context("join proxy unbind task")
+        .and_then(|result| {
+            result.with_context(|| format!("release proxy binding for sandbox {sandbox_id}"))
+        });
+        unbind.map_err(|err| OrchestratorError::InternalError(format!("{err:#}")))
+    }
+
+    /// Current number of proxy bindings (observability).
+    pub fn proxy_binding_count(&self) -> usize {
+        self.proxy_bindings.binding_count()
+    }
+
+    /// Build a resolver that fetches the proxy sandbox's executor on demand.
+    ///
+    /// Resolved per use rather than captured: the proxy handle can be replaced
+    /// (proxy restarted) or removed (proxy deleted) between binding attempts.
+    fn proxy_executor_resolver(&self, proxy_id: SandboxId) -> ProxyExecutor {
+        let sandboxes = Arc::clone(&self.sandboxes);
+        ProxyExecutor::new(move || {
+            let sandboxes = Arc::clone(&sandboxes);
+            async move {
+                let handle = {
+                    let table = sandboxes.read().await;
+                    table
+                        .get(&proxy_id)
+                        .cloned()
+                        .context("proxy sandbox is not running")?
+                };
+                let sandbox = handle.lock().await;
+                sandbox
+                    .process_executor()
+                    .context("proxy sandbox has no process executor")
+            }
+        })
+    }
+
+    /// Run a read command against a Paused sandbox's rootfs through the proxy.
+    ///
+    /// The target itself is never resumed: the command executes inside the
+    /// resident proxy sandbox, chrooted into the target's rootfs at its latest
+    /// pause generation. Every unreadable state is an explicit
+    /// [`ProxyReadFailure`] — a stale generation is never served silently
+    /// (read-path design §3.2.9, §5.3).
+    pub fn proxy_read(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        command: ProxyReadCommand,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<ProxyReadOutput, ProxyReadFailure>>
+                + Send
+                + '_,
+        >,
+    > {
+        let this = Arc::clone(self);
+        Box::pin(async move { this.proxy_read_inner(sandbox_id, command).await })
+    }
+
+    async fn proxy_read_inner(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+        command: ProxyReadCommand,
+    ) -> std::result::Result<ProxyReadOutput, ProxyReadFailure> {
+        // ① target exists
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await
+            .map_err(|err| {
+                error!(sandbox_id = %sandbox_id, error = %err, "proxy_read_store_failed");
+                ProxyReadFailure::BindingMissing
+            })?
+            .ok_or(ProxyReadFailure::TargetNotFound)?;
+
+        // ② only Paused targets are served: anything else is a caller contract
+        // violation, and routing it to the proxy would return a stale snapshot.
+        if metadata.state != SandboxState::Paused {
+            warn!(
+                sandbox_id = %sandbox_id,
+                state = %metadata.state,
+                "proxy_read_target_not_paused"
+            );
+            return Err(ProxyReadFailure::TargetNotPaused(metadata.state));
+        }
+
+        // ③ a proxy sandbox must exist to serve the read
+        let bindings = self.proxy_bindings.clone();
+        let entry = match bindings.proxy_entry(&sandbox_id) {
+            Some(entry) => entry,
+            None => {
+                let total = bindings.binding_count();
+                error!(
+                    sandbox_id = %sandbox_id,
+                    bindings = total,
+                    "proxy_binding_missing"
+                );
+                return Err(ProxyReadFailure::BindingMissing);
+            }
+        };
+        let proxy_id = entry.proxy_id();
+        let resolver = self.proxy_executor_resolver(proxy_id);
+        let executor = match resolver.get().await {
+            Ok(executor) => executor,
+            Err(err) => {
+                let message = format!("{err:#}");
+                error!(
+                    sandbox_id = %sandbox_id,
+                    proxy_id = %proxy_id,
+                    error = %message,
+                    "proxy_unavailable"
+                );
+                return Err(ProxyReadFailure::ProxyUnavailable(message));
+            }
+        };
+
+        // ④⑤ execute inside the target's chroot; ⑥ return with the generation.
+        // Failure logging (with the machine-readable tag that doubles as the
+        // server-side log tag) lives in the binding table, which owns the
+        // entry/slot context; keeping this tail free of closures that borrow
+        // across the await preserves the future's `Send`ness.
+        bindings.proxy_read(sandbox_id, command, executor).await
     }
 
     /// Resumes a paused sandbox from its snapshot.
@@ -2151,6 +2414,16 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
+            // The resident proxy carries a near-infinite TTL, but a caller could
+            // still PATCH a timeout onto it. Pausing it would strand every
+            // binding it holds, so it is never evicted.
+            if super::proxy_pool::is_proxy_sandbox(&metadata) {
+                debug!(
+                    sandbox_id = %metadata.id,
+                    "skipping auto-eviction of the resident proxy sandbox"
+                );
+                continue;
+            }
             let flush_volumes_before_delete =
                 matches!(metadata.timeout_action, SandboxTimeoutAction::Delete)
                     && !metadata.volume_mounts.is_empty();
@@ -2698,7 +2971,16 @@ where
                         unreachable!("paused sandboxes should have been filtered out")
                     }
                     SandboxState::Running => {
-                        if let Err(err) = self.pause_sandbox_inner(sandbox_id).await {
+                        if super::proxy_pool::is_proxy_sandbox(&metadata) {
+                            // The resident proxy is disposable infrastructure:
+                            // delete instead of pausing so restarts never
+                            // accumulate paused proxy records and snapshot
+                            // artifacts. The proxy has no volume mounts, so
+                            // the inner delete path is sufficient.
+                            if let Err(err) = self.delete_sandbox_inner(sandbox_id).await {
+                                last_failures.push(format!("{sandbox_id}: {err}"));
+                            }
+                        } else if let Err(err) = self.pause_sandbox_inner(sandbox_id).await {
                             last_failures.push(format!("{sandbox_id}: {err}"));
                         }
                     }
@@ -2890,7 +3172,7 @@ fn resources_with_runtime_info(
     resources
 }
 
-fn configured_runtime_versions() -> SnapshotRuntimeVersions {
+pub(crate) fn configured_runtime_versions() -> SnapshotRuntimeVersions {
     let config = ConfigManager::global_config();
     SnapshotRuntimeVersions::new(
         config

@@ -16,6 +16,7 @@ use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
 use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
+    MAX_DEFERRED_EXTRA_DRIVES,
 };
 use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
@@ -609,12 +610,38 @@ impl FirecrackerSnapshotConfig {
 }
 
 fn validate_overlaybd_extra_drive_set(extra_drives: &[ExtraDrive]) -> Result<()> {
-    if extra_drives.len() > MAX_EXTRA_DRIVES {
+    // Boot-mounted drives keep the single-letter `agentenv_drives` budget;
+    // deferred (attach-only) drives skip that protocol and get their own
+    // bound. Deferred drives must come after all mounted drives so the
+    // mounted prefix keeps contiguous device letters.
+    let mounted_count = extra_drives
+        .iter()
+        .filter(|drive| !drive.defer_mount())
+        .count();
+    if mounted_count > MAX_EXTRA_DRIVES {
         bail!(
             "too many extra drives: {} configured, but at most {} are supported (/dev/vdc..=/dev/vdz)",
-            extra_drives.len(),
+            mounted_count,
             MAX_EXTRA_DRIVES
         );
+    }
+    let deferred_count = extra_drives.len() - mounted_count;
+    if deferred_count > MAX_DEFERRED_EXTRA_DRIVES {
+        bail!(
+            "too many deferred extra drives: {} configured, but at most {} are supported",
+            deferred_count,
+            MAX_DEFERRED_EXTRA_DRIVES
+        );
+    }
+    if let Some(first_deferred) = extra_drives.iter().position(|drive| drive.defer_mount()) {
+        if extra_drives[first_deferred..]
+            .iter()
+            .any(|drive| !drive.defer_mount())
+        {
+            bail!(
+                "deferred (attach-only) extra drives must come after all boot-mounted extra drives"
+            );
+        }
     }
     let mut drive_ids = HashSet::new();
     let mut mount_paths = HashSet::new();
@@ -799,6 +826,7 @@ mod tests {
                 sub_path: None,
                 snapshot_output_dir: None,
                 volume: false,
+                defer_mount: false,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -809,6 +837,7 @@ mod tests {
                 sub_path: None,
                 snapshot_output_dir: None,
                 volume: false,
+                defer_mount: false,
             },
         ];
 
@@ -843,6 +872,7 @@ mod tests {
                     sub_path: None,
                     snapshot_output_dir: None,
                     volume: false,
+                    defer_mount: false,
                 }
             })
             .collect();
@@ -932,6 +962,7 @@ mod tests {
             virtual_size: 4096,
             mount_path: ExtraDrive::default_mount_path("data"),
             sub_path: None,
+            defer_mount: false,
         };
         let snapshot = RunnableSnapshot::from_test_legacy_manifest(
             SnapshotRecord::mock_ready(CommittedSnapshot::mock()),

@@ -25,6 +25,10 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .pool_max_idle_per_host(0)
+        // This client only talks to sandbox interaction IPs (10.11/169.254),
+        // which no HTTP proxy can reach. Never honor inherited http_proxy env
+        // or every readiness probe fails through the proxy.
+        .no_proxy()
         .build()
         .expect("build envd bootstrap HTTP client")
 });

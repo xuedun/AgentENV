@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -257,6 +257,22 @@ impl PausedSandboxState for FirecrackerPausedState {
             &self.snapshot_config.common,
         ))
     }
+
+    fn rootfs_image_config(&self) -> Option<OverlaybdConfig> {
+        self.snapshot_config.common.rootfs_image_config.clone()
+    }
+
+    fn env_vars(&self) -> std::collections::HashMap<String, String> {
+        self.snapshot_config
+            .common
+            .env_vars
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn workdir(&self) -> Option<String> {
+        self.snapshot_config.common.default_workdir.clone()
+    }
 }
 
 impl FirecrackerCapturedSnapshot {
@@ -477,6 +493,21 @@ impl SandboxBackend for FirecrackerSandbox {
                 self.runtime_image_config_paths(),
             ),
         }
+    }
+
+    fn process_executor(&self) -> Result<Executor> {
+        SandboxExecutor::executor(self)
+    }
+
+    fn deferred_drive_dev_ids(&self) -> Vec<(String, u32)> {
+        self.launch
+            .common()
+            .extra_drives
+            .iter()
+            .zip(self.extra_drive_runtimes.iter())
+            .filter(|(drive, _)| drive.defer_mount())
+            .map(|(drive, runtime)| (drive.drive_id().to_string(), runtime.device.dev_id()))
+            .collect()
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {
@@ -948,6 +979,53 @@ impl FirecrackerSandbox {
         self.snapshot_compression_override = Some(output);
     }
 
+    /// Flush the guest's rootfs dirty pages before pausing (read-path design
+    /// §3.5, change #2).
+    ///
+    /// Without this, writes still sitting in the guest page cache are not part
+    /// of the sealed rootfs layer, so a proxy bound to that generation would
+    /// read stale data. Best-effort: a failure only means the generation may
+    /// lack its trailing writes, and must never block the pause itself.
+    async fn sync_rootfs_best_effort(&self) {
+        let Some(envd) = self.envd_instance.clone() else {
+            return;
+        };
+        let sandbox_id = self.id;
+        // Driven on a blocking thread with its own runtime, exactly like
+        // `sync_writable_volume_filesystems`: `run_guest_command` borrows its
+        // argv across an await, and confining that to a dedicated thread keeps
+        // this future (and the `SandboxBackend::pause` impl calling it) `Send`.
+        let result = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current()
+                .block_on(Self::run_guest_command(
+                    envd,
+                    "/agentenv/bin/busybox".to_owned(),
+                    vec!["sync".to_owned()],
+                ))
+                .map(|output| output.exit_code)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(code)) => warn!(
+                sandbox_id = %sandbox_id,
+                exit_code = code,
+                "rootfs sync before pause exited non-zero; the sealed rootfs may lack trailing writes"
+            ),
+            Ok(Err(err)) => warn!(
+                sandbox_id = %sandbox_id,
+                error = %format_args!("{err:#}"),
+                "failed to sync rootfs before pause; the sealed rootfs may lack trailing writes"
+            ),
+            Err(err) => warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "rootfs sync task failed before pause"
+            ),
+        }
+    }
+
     /// Pause the running sandbox and persist its snapshot artifacts into a caller-managed directory.
     #[tracing::instrument(skip(self, snapshot_dir))]
     pub async fn pause_to_dir(
@@ -955,6 +1033,7 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        self.sync_rootfs_best_effort().await;
         if self.has_writable_persistent_volumes() {
             let envd = self
                 .envd_instance
@@ -1369,16 +1448,24 @@ fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -
 /// Kubernetes-style `subPath` semantics. API validation rejects `:` in both
 /// `mountPath` and `subPath`, so the `:` separators are unambiguous.
 fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
-    if extra_drives.is_empty() {
+    // Deferred (attach-only) drives are excluded: they carry no boot-time
+    // mount entry and the guest only probes their block devices. Validation
+    // guarantees deferred drives come after all boot-mounted drives, so the
+    // device letters of the mounted prefix are unchanged by the filtering.
+    let mounted: Vec<&ExtraDrive> = extra_drives
+        .iter()
+        .filter(|drive| !drive.defer_mount())
+        .collect();
+    if mounted.is_empty() {
         return None;
     }
     assert!(
-        extra_drives.len() <= MAX_EXTRA_DRIVES,
+        mounted.len() <= MAX_EXTRA_DRIVES,
         "too many extra drives for guest naming: {} > {}",
-        extra_drives.len(),
+        mounted.len(),
         MAX_EXTRA_DRIVES
     );
-    let entries: Vec<String> = extra_drives
+    let entries: Vec<String> = mounted
         .iter()
         .enumerate()
         .map(|(i, drive)| {

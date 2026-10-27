@@ -199,6 +199,28 @@ pub enum SandboxesSandboxIdPausePostResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesSandboxIdProxyReadPostResponse {
+    /// The command completed
+    Status200_TheCommandCompleted(models::ProxyReadResponse),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Target sandbox not found
+    Status404_TargetSandboxNotFound(models::ProxyReadError),
+    /// Target sandbox is not Paused
+    Status409_TargetSandboxIsNotPaused(models::ProxyReadError),
+    /// Command output is not valid UTF-8
+    Status422_CommandOutputIsNotValidUTF(models::ProxyReadError),
+    /// Proxy binding missing (invariant violation)
+    Status500_ProxyBindingMissing(models::ProxyReadError),
+    /// Proxy unavailable, or the target's binding is still being established or failed for this pause generation
+    Status503_ProxyUnavailable(models::ProxyReadError),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesSandboxIdRefreshesPostResponse {
     /// Successfully refreshed the sandbox
     Status204_SuccessfullyRefreshedTheSandbox,
@@ -424,6 +446,20 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SandboxesSandboxIdPausePostPathParams,
     ) -> Result<SandboxesSandboxIdPausePostResponse, E>;
+
+    /// Execute a read command against a paused sandbox via the proxy.
+    ///
+    /// SandboxesSandboxIdProxyReadPost - POST /sandboxes/{sandboxID}/proxy-read
+    async fn sandboxes_sandbox_id_proxy_read_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdProxyReadPostPathParams,
+        body: &models::ProxyReadRequest,
+    ) -> Result<SandboxesSandboxIdProxyReadPostResponse, E>;
 
     /// Refresh sandbox.
     ///

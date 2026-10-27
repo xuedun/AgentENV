@@ -155,6 +155,7 @@ impl PosixFsRuntimeResolver {
                     virtual_size,
                     mount_path,
                     sub_path,
+                    defer_mount,
                 } => {
                     if *virtual_size == 0 {
                         return Err(RepositoryError::InvalidRequest {
@@ -201,6 +202,7 @@ impl PosixFsRuntimeResolver {
                             crate::sandbox::ExtraDrive::default_mount_path(drive_id)
                         }),
                         sub_path: sub_path.clone(),
+                        defer_mount: *defer_mount,
                     });
                 }
             }

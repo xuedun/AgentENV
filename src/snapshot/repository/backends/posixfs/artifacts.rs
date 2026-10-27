@@ -90,6 +90,7 @@ impl PosixFsArtifactStore {
                         crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
                     }),
                     sub_path: drive.sub_path.clone(),
+                    defer_mount: drive.defer_mount,
                 })
             })
             .collect::<RepositoryResult<Vec<_>>>()?;
@@ -847,6 +848,7 @@ mod tests {
                 sub_path: None,
                 snapshot_output_dir: None,
                 volume: false,
+                defer_mount: false,
             }])
             .expect("attached drive manifest should include virtual size");
 

@@ -79,9 +79,13 @@ impl ProcessHandle {
     }
 
     /// Wait for the process to exit and collect all remaining output.
+    ///
+    /// Output bytes are accumulated per stream and decoded once at the end:
+    /// decoding each stream event separately would split multi-byte UTF-8
+    /// characters across event boundaries into replacement characters.
     pub async fn wait(&mut self) -> Result<ProcessOutput> {
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
 
         let collect = async {
             while let Some(response) = self.stream.next().await {
@@ -98,8 +102,8 @@ impl ProcessHandle {
                     }
                     Some(process_event::Event::End(end_event)) => {
                         return Ok(ProcessOutput {
-                            stdout,
-                            stderr,
+                            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                            stderr: String::from_utf8_lossy(&stderr).into_owned(),
                             exit_code: end_event.exit_code,
                         });
                     }
@@ -159,18 +163,21 @@ impl ProcessHandle {
         self.send_signal(Signal::Sigkill).await
     }
 
-    /// Extract stdout/stderr from a DataEvent into the provided buffers.
+    /// Append a DataEvent's stdout/stderr bytes to the provided buffers.
+    ///
+    /// Bytes are accumulated raw; UTF-8 decoding happens once when the process
+    /// exits so characters spanning event boundaries stay intact.
     fn collect_output(
         data_event: &process_event::DataEvent,
-        stdout: &mut String,
-        stderr: &mut String,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
     ) {
         match &data_event.output {
             Some(process_event::data_event::Output::Stdout(bytes)) => {
-                stdout.push_str(&String::from_utf8_lossy(bytes));
+                stdout.extend_from_slice(bytes)
             }
             Some(process_event::data_event::Output::Stderr(bytes)) => {
-                stderr.push_str(&String::from_utf8_lossy(bytes));
+                stderr.extend_from_slice(bytes)
             }
             _ => {}
         }
@@ -183,9 +190,15 @@ impl ProcessHandle {
 ///
 /// Obtained via [`SandboxExecutor::executor`][crate::sandbox::SandboxExecutor::executor].
 /// Owns a lightweight clone of the sandbox's envd connection settings.
+#[derive(Clone)]
 pub struct Executor {
     envd_instance: EnvdInstance,
 }
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync + 'static>() {}
+    assert_send_sync::<Executor>();
+};
 
 impl Executor {
     pub(super) fn new(envd_instance: EnvdInstance) -> Self {

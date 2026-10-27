@@ -107,7 +107,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         store,
         factory,
         persister,
-        sandboxes: RwLock::new(HashMap::new()),
+        sandboxes: Arc::new(RwLock::new(HashMap::new())),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
@@ -119,6 +119,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
+        proxy_bindings: Arc::new(ProxyBindingTable::default()),
     })
 }
 

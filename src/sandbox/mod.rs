@@ -27,7 +27,7 @@ pub use backend::{
 };
 pub use extra_drive::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
-    validate_sub_path, ExtraDrive,
+    validate_sub_path, ExtraDrive, MAX_DEFERRED_EXTRA_DRIVES,
 };
 pub use firecracker::{
     FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,

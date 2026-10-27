@@ -373,6 +373,7 @@ mod tests {
                 virtual_size: 4096,
                 mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
                 sub_path: None,
+                defer_mount: false,
             }],
         )
     }

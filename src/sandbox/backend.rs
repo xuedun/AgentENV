@@ -39,6 +39,29 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn control_plane_port(&self) -> Option<u16> {
         None
     }
+
+    /// OverlayBD config of the paused sandbox's rootfs — the staged snapshot
+    /// config produced by `pause`.
+    ///
+    /// This is the stable binding source for the proxy read path: `pause` tears
+    /// down the target's own devices and runtime directories, so this
+    /// self-contained config is the only complete frozen view of the rootfs
+    /// that outlives it (and `resume` rebuilds from the very same config).
+    /// `None` for backends without OverlayBD rootfs state.
+    fn rootfs_image_config(&self) -> Option<super::OverlaybdConfig> {
+        None
+    }
+
+    /// Environment variables recorded in the paused runtime, so a proxy can
+    /// execute read commands with the target's own environment.
+    fn env_vars(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+
+    /// Working directory recorded for the paused sandbox.
+    fn workdir(&self) -> Option<String> {
+        None
+    }
 }
 
 impl dyn PausedSandboxState {
@@ -261,6 +284,24 @@ pub trait SandboxBackend: Send + 'static {
 
     /// Return runtime facts that are only known after the backend has started.
     fn runtime_info(&self) -> SandboxRuntimeInfo;
+
+    /// A cloneable, `Send` process executor for this running sandbox.
+    ///
+    /// Unlike [`SandboxExecutor::executor`] (an `async_trait(?Send)` method),
+    /// this is a plain synchronous accessor so orchestrator-side tasks can
+    /// obtain an executor without holding the sandbox lock across awaits.
+    /// Backends without in-guest execution return an error.
+    fn process_executor(&self) -> Result<Executor> {
+        Err(anyhow::anyhow!(
+            "sandbox backend does not support process execution"
+        ))
+    }
+
+    /// `(drive_id, dev_id)` of deferred (attach-only) extra drives, in attach
+    /// order. Empty for backends without ublk extra drives.
+    fn deferred_drive_dev_ids(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
 
     /// Local runtime artifacts this sandbox opens on start.
     fn startup_artifacts(&self) -> RuntimeArtifactSet;

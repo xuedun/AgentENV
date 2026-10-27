@@ -22,6 +22,11 @@ pub enum ResolvedAttachedDrive {
         mount_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_path: Option<PathBuf>,
+        /// Attach without a boot-time guest mount (proxy slot drives set
+        /// this). Must survive the commit/resolve round-trip or restored
+        /// proxy sandboxes register zero deferred slots.
+        #[serde(default)]
+        defer_mount: bool,
     },
 }
 
@@ -36,6 +41,9 @@ pub enum CommittedAttachedDrive {
         mount_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_path: Option<PathBuf>,
+        /// Whether the drive was attached without a boot-time guest mount.
+        #[serde(default)]
+        defer_mount: bool,
     },
 }
 
@@ -49,6 +57,7 @@ impl ResolvedAttachedDrive {
                 virtual_size,
                 mount_path,
                 sub_path,
+                defer_mount,
             } => ExtraDrive::Overlaybd {
                 drive_id: drive_id.clone(),
                 image_config_path: image_config_path.clone(),
@@ -58,6 +67,7 @@ impl ResolvedAttachedDrive {
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: None,
                 volume: false,
+                defer_mount: *defer_mount,
             },
         }
     }
@@ -113,6 +123,7 @@ mod tests {
             virtual_size: 4096,
             mount_path: ExtraDrive::default_mount_path("data"),
             sub_path: None,
+            defer_mount: false,
         }
     }
 
@@ -172,6 +183,7 @@ mod tests {
             virtual_size: 4096,
             mount_path: ExtraDrive::default_mount_path("data"),
             sub_path: None,
+            defer_mount: false,
         };
         let committed_json = serde_json::to_value(&committed).unwrap();
         assert_eq!(committed_json["Overlaybd"]["virtual_size"], 4096);

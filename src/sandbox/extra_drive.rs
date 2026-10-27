@@ -14,6 +14,12 @@ pub(crate) const ROOTFS_DRIVE_ID: &str = "rootfs";
 pub(crate) const USER_ROOTFS_DRIVE_ID: &str = "user_rootfs";
 pub(crate) const VOLUME_DRIVE_SLOT_PREFIX: &str = "agentenv_volume_slot_";
 
+/// Upper bound for deferred (attach-only) extra drives. Deferred drives skip
+/// the boot-time `agentenv_drives` mount protocol, so they are not limited by
+/// `MAX_EXTRA_DRIVES`' single-letter device naming; this bound only guards
+/// against exhausting kernel ublk device and virtio slot budgets.
+pub const MAX_DEFERRED_EXTRA_DRIVES: usize = 128;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExtraDrive {
     Overlaybd {
@@ -43,6 +49,11 @@ pub enum ExtraDrive {
         /// manifests and rebound through reserved Firecracker slots.
         #[serde(default)]
         volume: bool,
+        /// Attach the drive without a boot-time guest mount. The guest kernel
+        /// only probes the block device; mounting is deferred to runtime
+        /// (proxy slot drives are mounted on demand by envd).
+        #[serde(default)]
+        defer_mount: bool,
     },
 }
 
@@ -83,6 +94,7 @@ impl ExtraDrive {
             sub_path,
             snapshot_output_dir: None,
             volume: false,
+            defer_mount: false,
         })
     }
 
@@ -99,6 +111,13 @@ impl ExtraDrive {
     pub fn read_only(&self) -> bool {
         match self {
             Self::Overlaybd { read_only, .. } => *read_only,
+        }
+    }
+
+    /// Whether this drive skips the boot-time guest mount (attach-only).
+    pub fn defer_mount(&self) -> bool {
+        match self {
+            Self::Overlaybd { defer_mount, .. } => *defer_mount,
         }
     }
 
@@ -160,6 +179,7 @@ impl ExtraDrive {
                 mount_path,
                 virtual_size,
                 sub_path,
+                defer_mount,
                 ..
             } => Self::Overlaybd {
                 drive_id: drive_id.clone(),
@@ -170,6 +190,7 @@ impl ExtraDrive {
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: output_dir,
                 volume: true,
+                defer_mount: *defer_mount,
             },
         }
     }
@@ -184,6 +205,7 @@ impl ExtraDrive {
                 sub_path,
                 snapshot_output_dir,
                 volume,
+                defer_mount,
                 ..
             } => Self::Overlaybd {
                 drive_id: drive_id.clone(),
@@ -194,6 +216,7 @@ impl ExtraDrive {
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: snapshot_output_dir.clone(),
                 volume: *volume,
+                defer_mount: *defer_mount,
             },
         }
     }
@@ -211,7 +234,7 @@ impl ExtraDrive {
                 mount_path,
                 snapshot_output_dir,
                 volume,
-                sub_path,
+                defer_mount,
                 ..
             } => Ok(Self::Overlaybd {
                 drive_id: drive_id.clone(),
@@ -219,10 +242,39 @@ impl ExtraDrive {
                 read_only: *read_only,
                 mount_path: mount_path.clone(),
                 virtual_size: Some(virtual_size),
-                sub_path: sub_path.clone(),
+                sub_path: None,
                 snapshot_output_dir: snapshot_output_dir.clone(),
                 volume: *volume,
+                defer_mount: *defer_mount,
             }),
+        }
+    }
+
+    /// Mark the drive as attach-only: the guest probes the block device at
+    /// boot but mounting is deferred to runtime.
+    pub fn with_defer_mount(self, defer_mount: bool) -> Self {
+        match self {
+            Self::Overlaybd {
+                drive_id,
+                image_config_path,
+                read_only,
+                mount_path,
+                virtual_size,
+                sub_path,
+                snapshot_output_dir,
+                volume,
+                ..
+            } => Self::Overlaybd {
+                drive_id,
+                image_config_path,
+                read_only,
+                mount_path,
+                virtual_size,
+                sub_path,
+                snapshot_output_dir,
+                volume,
+                defer_mount,
+            },
         }
     }
 }

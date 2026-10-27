@@ -575,6 +575,49 @@ impl UblkDaemonClient {
         }
     }
 
+    /// Make `slot_dev_id` serve `source_dev_id`'s overlaybd stack.
+    ///
+    /// Proxy-sandbox rebind: the slot keeps its device node while the daemon
+    /// swaps its backing image and resizes it to the source geometry. The
+    /// source device shell is released back to the pool.
+    pub async fn adopt_slot_target(&self, slot_dev_id: u32, source_dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::AdoptSlotTarget {
+            slot_dev_id,
+            source_dev_id,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::SlotTargetAdopted { .. } => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: adopt slot target slot={slot_dev_id} source={source_dev_id} failed terminally: {message}")
+            }
+            DaemonResponse::InvalidRequest { message } => {
+                Err(InvalidRequestError::new(message).into())
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: adopt slot target slot={slot_dev_id} source={source_dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for adopt slot target: {other:?}"),
+        }
+    }
+
+    /// Drop a slot device's adopted binding, returning it to a placeholder.
+    pub async fn unbind_slot(&self, slot_dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::UnbindSlot { slot_dev_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::SlotUnbound { .. } => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: unbind slot {slot_dev_id} failed terminally: {message}")
+            }
+            DaemonResponse::InvalidRequest { message } => {
+                Err(InvalidRequestError::new(message).into())
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: unbind slot {slot_dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for unbind slot: {other:?}"),
+        }
+    }
+
     /// Check if the daemon is alive, then send a request and wait for a response.
     async fn call(&self, request: DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
         // Fail fast if daemon is dead.

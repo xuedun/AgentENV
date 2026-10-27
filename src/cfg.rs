@@ -114,6 +114,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub volume: VolumeConfig,
     #[config(nested)]
+    pub proxy: ProxyConfig,
+    #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
@@ -302,6 +304,29 @@ pub struct VolumeConfig {
     /// Maximum number of persistent volumes a sandbox may mount.
     #[config(default = 4usize)]
     pub max_volume_count: usize,
+}
+
+/// Resident proxy sandbox pool (see the proxy-sandbox read-path design).
+///
+/// When enabled, the server starts a long-lived proxy sandbox whose deferred
+/// slot drives are reserved attach-only block devices, later rebound to
+/// paused sandboxes' rootfs stacks for proxied read operations.
+#[derive(Debug, Config, Clone)]
+pub struct ProxyConfig {
+    /// Start the resident proxy sandbox when the server starts.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Base image for the proxy sandbox. Also used as the shared placeholder
+    /// source for its deferred slot drives. Prefer a pinned tag (or digest):
+    /// the image digest is part of the proxy template identity and drift
+    /// triggers template rebuilds.
+    #[config(default = "ubuntu:22.04", env = "AENV_PROXY_IMAGE")]
+    pub image: String,
+    /// Deferred (attach-only) slot drives reserved per proxy sandbox. Fixed
+    /// for the lifetime of the proxy VM (Firecracker device topology is
+    /// immutable after boot); not limited by the 24 boot-mounted drive budget.
+    #[config(default = 24usize, env = "AENV_PROXY_SLOTS_PER_PROXY")]
+    pub slots_per_proxy: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -961,6 +986,24 @@ impl AppConfig {
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
+        self.validate_proxy_config()?;
+        Ok(())
+    }
+
+    fn validate_proxy_config(&self) -> Result<()> {
+        if !self.proxy.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.proxy.image.trim().is_empty(),
+            "proxy.image must not be empty"
+        );
+        anyhow::ensure!(
+            self.proxy.slots_per_proxy > 0
+                && self.proxy.slots_per_proxy <= crate::sandbox::MAX_DEFERRED_EXTRA_DRIVES,
+            "proxy.slots_per_proxy must be between 1 and {}",
+            crate::sandbox::MAX_DEFERRED_EXTRA_DRIVES
+        );
         Ok(())
     }
 

@@ -738,6 +738,87 @@ components:
           maximum: 3600 # 1 hour
           minimum: 0
 
+    ProxyReadRequest:
+      type: object
+      required:
+        - command
+      properties:
+        command:
+          type: string
+          description: >-
+            Shell command to execute against the paused sandbox's rootfs. The
+            command runs inside the resident proxy sandbox via chroot into the
+            target's filesystem, so absolute paths and the target image's own
+            binaries resolve exactly as they would inside the sandbox.
+            Read-only commands that do not depend on environment variables are
+            the supported scope.
+        cwd:
+          type: string
+          description: >-
+            Working directory inside the target sandbox's filesystem. Defaults
+            to the target's recorded workdir, then to "/".
+        envs:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            Additional environment variables for this call. Highest priority in
+            the three-layer merge (image ENV, sandbox env_vars, request envs).
+        timeoutSecs:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 300
+          description: Execution timeout in seconds. Defaults to 30.
+
+    ProxyReadResponse:
+      type: object
+      required:
+        - exitCode
+        - stdout
+        - stderr
+        - durationMs
+        - bindingGeneration
+      properties:
+        exitCode:
+          type: integer
+          format: int32
+          description: Exit code of the command inside the proxy sandbox.
+        stdout:
+          type: string
+          description: Captured standard output (up to 10 MiB).
+        stderr:
+          type: string
+          description: Captured standard error (up to 10 MiB).
+        durationMs:
+          type: integer
+          format: int64
+          description: Command execution duration in milliseconds.
+        bindingGeneration:
+          type: integer
+          format: int64
+          description: >-
+            Pause generation of the rootfs view the command ran against.
+            Observability only; the view always matches the target's latest
+            pause when the call succeeds.
+
+    ProxyReadError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: >-
+            Machine-readable error tag: target_not_found, target_not_paused,
+            output_not_utf8, proxy_binding_missing, proxy_unavailable,
+            rebind_in_progress, rebind_failed. The server logs the same string
+            so client and server logs can be correlated.
+        message:
+          type: string
+          description: Human-readable detail.
+
     SandboxSnapshotRequest:
       type: object
       properties:
@@ -1751,6 +1832,75 @@ paths:
           $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/proxy-read:
+    post:
+      summary: Execute a read command against a paused sandbox via the proxy
+      description: >-
+        Run a short read-only command against the rootfs of a Paused sandbox
+        without resuming it. The command executes inside the resident proxy
+        sandbox, chrooted into the target's rootfs at its latest pause
+        generation. Only Paused targets are served: any other state is a
+        contract violation and returns 409 rather than silently serving a stale
+        snapshot.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProxyReadRequest"
+      responses:
+        "200":
+          description: The command completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyReadResponse"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          description: Target sandbox not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyReadError"
+        "409":
+          description: Target sandbox is not Paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyReadError"
+        "422":
+          description: Command output is not valid UTF-8
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyReadError"
+        "500":
+          description: Proxy binding missing (invariant violation)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyReadError"
+        "503":
+          description: >-
+            Proxy unavailable, or the target's binding is still being
+            established or failed for this pause generation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyReadError"
 
   /sandboxes/{sandboxID}/resume:
     post:

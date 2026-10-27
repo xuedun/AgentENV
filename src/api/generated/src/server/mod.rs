@@ -78,6 +78,10 @@ where
             post(sandboxes_sandbox_id_pause_post::<I, A, E, C>),
         )
         .route(
+            "/sandboxes/{sandbox_id}/proxy-read",
+            post(sandboxes_sandbox_id_proxy_read_post::<I, A, E, C>),
+        )
+        .route(
             "/sandboxes/{sandbox_id}/refreshes",
             post(sandboxes_sandbox_id_refreshes_post::<I, A, E, C>),
         )
@@ -2427,6 +2431,252 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(validator::Validate)]
+#[allow(dead_code)]
+struct SandboxesSandboxIdProxyReadPostBodyValidator<'a> {
+    #[validate(nested)]
+    body: &'a models::ProxyReadRequest,
+}
+
+#[tracing::instrument(skip_all)]
+fn sandboxes_sandbox_id_proxy_read_post_validation(
+    path_params: models::SandboxesSandboxIdProxyReadPostPathParams,
+    body: models::ProxyReadRequest,
+) -> std::result::Result<
+    (
+        models::SandboxesSandboxIdProxyReadPostPathParams,
+        models::ProxyReadRequest,
+    ),
+    ValidationErrors,
+> {
+    path_params.validate()?;
+    let b = SandboxesSandboxIdProxyReadPostBodyValidator { body: &body };
+    b.validate()?;
+
+    Ok((path_params, body))
+}
+/// SandboxesSandboxIdProxyReadPost - POST /sandboxes/{sandboxID}/proxy-read
+#[tracing::instrument(skip_all)]
+async fn sandboxes_sandbox_id_proxy_read_post<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::SandboxesSandboxIdProxyReadPostPathParams>,
+    State(api_impl): State<I>,
+    Json(body): Json<models::ProxyReadRequest>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::ApiKeyAuthHeader<Claims = C>
+        + apis::ApiAuthBasic<Claims = C>
+        + Send
+        + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-Team-ID")
+        .await;
+    let claims_in_auth_header = api_impl
+        .as_ref()
+        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
+        .await;
+    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        sandboxes_sandbox_id_proxy_read_post_validation(path_params, body)
+    })
+    .await
+    .unwrap();
+
+    let Ok((path_params, body)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .sandboxes_sandbox_id_proxy_read_post(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &body,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+                                            Ok(rsp) => match rsp {
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status200_TheCommandCompleted
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(200);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status404_TargetSandboxNotFound
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(404);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status409_TargetSandboxIsNotPaused
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status422_CommandOutputIsNotValidUTF
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(422);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status500_ProxyBindingMissing
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdProxyReadPostResponse::Status503_ProxyUnavailable
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(

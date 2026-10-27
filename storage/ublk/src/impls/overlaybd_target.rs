@@ -158,6 +158,14 @@ impl OverlaybdTarget {
         Ok(())
     }
 
+    /// Virtual size of the currently bound image in sectors.
+    ///
+    /// Lets callers detect whether a [`swap_state`](Self::swap_state) also needs
+    /// a device resize.
+    pub fn current_sectors(&self) -> u64 {
+        self.state.load().dev_sectors
+    }
+
     fn request_meta(
         &self,
         state: &TargetState,

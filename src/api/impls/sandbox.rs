@@ -14,8 +14,9 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxRequest, NewTimeout, OrchestratorError, ProxyReadCommand, ProxyReadFailure,
+    SandboxForkChildSpec, SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState,
+    SandboxTimeoutAction,
 };
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -36,6 +37,31 @@ use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
+}
+
+/// Map a proxy-read failure onto its HTTP response (synchronous so no borrow
+/// of the failure crosses the handler's await points).
+fn proxy_read_failure_response(
+    failure: ProxyReadFailure,
+) -> SandboxesSandboxIdProxyReadPostResponse {
+    let status = failure.status();
+    let error = proxy_read_error(failure.code(), failure.to_string());
+    match status {
+        404 => SandboxesSandboxIdProxyReadPostResponse::Status404_TargetSandboxNotFound(error),
+        409 => SandboxesSandboxIdProxyReadPostResponse::Status409_TargetSandboxIsNotPaused(error),
+        422 => SandboxesSandboxIdProxyReadPostResponse::Status422_CommandOutputIsNotValidUTF(error),
+        503 => SandboxesSandboxIdProxyReadPostResponse::Status503_ProxyUnavailable(error),
+        // 500: proxy_binding_missing and execution failures.
+        _ => SandboxesSandboxIdProxyReadPostResponse::Status500_ProxyBindingMissing(error),
+    }
+}
+
+/// Build a `proxy-read` error body.
+///
+/// `code` is the machine-readable tag; the server logs the same string, so
+/// client- and server-side logs can be correlated by grepping the code.
+fn proxy_read_error(code: &str, message: impl Into<String>) -> models::ProxyReadError {
+    models::ProxyReadError::new(code.to_string(), message.into())
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -1523,6 +1549,50 @@ impl Sandboxes<()> for ApiImpl {
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                 err.into(),
             )),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_proxy_read_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdProxyReadPostPathParams,
+        body: &models::ProxyReadRequest,
+    ) -> Result<SandboxesSandboxIdProxyReadPostResponse, ()> {
+        let path_id = path_params.sandbox_id.clone();
+        let Ok(sandbox_id) = SandboxId::parse_str(&path_id) else {
+            return Ok(
+                SandboxesSandboxIdProxyReadPostResponse::Status404_TargetSandboxNotFound(
+                    proxy_read_error("target_not_found", format!("sandbox {path_id} not found")),
+                ),
+            );
+        };
+
+        let command = ProxyReadCommand {
+            command: body.command.clone(),
+            cwd: body.cwd.clone(),
+            envs: body.envs.clone().unwrap_or_default(),
+            timeout: body
+                .timeout_secs
+                .map(|secs| Duration::from_secs(u64::from(secs))),
+        };
+
+        let orchestrator = self.orchestrator();
+        match orchestrator.proxy_read(sandbox_id, command).await {
+            Ok(output) => Ok(
+                SandboxesSandboxIdProxyReadPostResponse::Status200_TheCommandCompleted(
+                    models::ProxyReadResponse::new(
+                        output.exit_code,
+                        output.stdout,
+                        output.stderr,
+                        i64::try_from(output.duration_ms).unwrap_or(i64::MAX),
+                        i64::try_from(output.binding_generation).unwrap_or(i64::MAX),
+                    ),
+                ),
+            ),
+            Err(failure) => Ok(proxy_read_failure_response(failure)),
         }
     }
 

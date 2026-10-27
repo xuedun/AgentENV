@@ -1455,6 +1455,7 @@ impl OssSnapshotRepository {
                     crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
                 }),
                 sub_path: drive.sub_path.clone(),
+                defer_mount: drive.defer_mount,
             });
         }
 

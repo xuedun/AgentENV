@@ -2,6 +2,8 @@ mod launch_plan;
 mod metrics;
 mod persistence;
 mod proxy;
+mod proxy_binding;
+mod proxy_pool;
 mod service;
 mod store;
 mod types;
@@ -15,6 +17,8 @@ pub use persistence::{
     SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
+pub use proxy_binding::{ProxyReadCommand, ProxyReadFailure, ProxyReadOutput};
+pub use proxy_pool::init_proxy_pool;
 pub use service::Orchestrator;
 pub use store::{
     InMemoryMetadataStore, MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata,

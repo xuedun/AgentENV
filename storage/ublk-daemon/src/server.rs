@@ -147,6 +147,9 @@ struct PoolState {
     image_service: ImageService,
     /// Directory holding placeholder sparse files (daemon-owned, not the cache).
     placeholder_dir: PathBuf,
+    /// Per-slot mutexes serializing adopt/unbind on the same slot device so
+    /// concurrent rebinds cannot interleave their target swaps.
+    slot_locks: DashMap<u32, Arc<Mutex<()>>>,
 }
 
 impl PoolState {
@@ -168,7 +171,18 @@ impl PoolState {
             placeholders: Mutex::new(HashMap::new()),
             image_service,
             placeholder_dir,
+            slot_locks: DashMap::new(),
         }
+    }
+
+    /// Per-slot serialization lock. Different slots stay parallel; adopt and
+    /// unbind on one slot are mutually exclusive.
+    fn slot_lock(&self, slot_dev_id: u32) -> Arc<Mutex<()>> {
+        let entry = self
+            .slot_locks
+            .entry(slot_dev_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+        Arc::clone(&entry)
     }
 
     /// Get (or lazily build) a daemon-owned sparse placeholder image whose
@@ -583,6 +597,16 @@ async fn handle_connection(
             dev_id,
             new_sectors,
         } => handle_update_size(&pool_state, dev_id, new_sectors).await,
+        DaemonRequest::AdoptSlotTarget {
+            slot_dev_id,
+            source_dev_id,
+        } => {
+            handle_adopt_slot_target(&pool_state, ctrl_ring.clone(), slot_dev_id, source_dev_id)
+                .await
+        }
+        DaemonRequest::UnbindSlot { slot_dev_id } => {
+            handle_unbind_slot(&pool_state, slot_dev_id).await
+        }
         DaemonRequest::Shutdown => {
             shutdown.notify_one();
             Ok(DaemonResponse::Ok)
@@ -1397,6 +1421,190 @@ async fn handle_update_size(
     }
 
     bail!("device {dev_id} not found in active pool");
+}
+
+// ── Slot adopt / unbind (proxy sandbox rebind) ─────────────────────────────
+
+/// Make `slot_dev_id` serve `source_dev_id`'s overlaybd stack.
+///
+/// The slot keeps its device node and dev_id (Firecracker fixed both at boot);
+/// only its backing image changes. Sequence:
+///
+/// 1. take the source's `ImageFile` and geometry,
+/// 2. atomically swap the slot target's state,
+/// 3. invalidate the host block cache for the slot node so cached pages of the
+///    old stack cannot be served,
+/// 4. resize the slot to the source geometry when it differs,
+/// 5. release the source device shell back to the pool (its `ImageFile` stays
+///    alive through the slot's `Arc` clone).
+///
+/// A failure after step 2 leaves the slot bound to the new stack; callers treat
+/// the binding as failed and recover with `UnbindSlot`.
+async fn handle_adopt_slot_target(
+    pool_state: &Option<Arc<PoolState>>,
+    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    slot_dev_id: u32,
+    source_dev_id: u32,
+) -> Result<DaemonResponse> {
+    let pool = pool_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("warm pool not enabled"))?;
+    if slot_dev_id == source_dev_id {
+        bail!("slot and source device must differ (dev_id={slot_dev_id})");
+    }
+
+    // Serialize adopt/unbind per slot; distinct slots stay parallel.
+    let slot_guard = pool.slot_lock(slot_dev_id);
+    let _slot_guard = slot_guard.lock().await;
+
+    let (source_image, source_config, virtual_size, new_sectors, discard_supported) = {
+        let (image, config) = {
+            // Keep the DashMap guard scoped: `is_read_only` awaits, and holding
+            // a shard guard across an await can stall unrelated writers.
+            let source = pool
+                .active_exclusive
+                .get(&source_dev_id)
+                .with_context(|| format!("source device {source_dev_id} not found for adopt"))?;
+            (Arc::clone(&source.image), source.image_config.clone())
+        };
+        let size = image.size_bytes();
+        let sectors = image.num_lbas();
+        let discard = !image.is_read_only().await;
+        (image, config, size, sectors, discard)
+    };
+
+    let (slot_path, old_sectors) = {
+        let slot = pool
+            .active_exclusive
+            .get(&slot_dev_id)
+            .with_context(|| format!("slot device {slot_dev_id} not found for adopt"))?;
+        (slot.dev.device_path(), slot.image.num_lbas())
+    };
+
+    // Resizing needs UBLK_F_UPDATE_SIZE; refuse before mutating anything so the
+    // slot keeps serving its previous stack on an unsupported kernel.
+    if new_sectors != old_sectors && !pool.supports_update_size() {
+        bail!(
+            "adopting dev_id={source_dev_id} into slot {slot_dev_id} changes geometry \
+             ({old_sectors} -> {new_sectors} sectors) but UBLK_F_UPDATE_SIZE is unsupported"
+        );
+    }
+
+    {
+        let mut slot = pool
+            .active_exclusive
+            .get_mut(&slot_dev_id)
+            .with_context(|| format!("slot device {slot_dev_id} disappeared during adopt"))?;
+        slot.dev
+            .target()
+            .swap_state(
+                source_config.clone(),
+                Arc::clone(&source_image),
+                discard_supported,
+            )
+            .with_context(|| format!("swap slot {slot_dev_id} target state"))?;
+        slot.image = Arc::clone(&source_image);
+        slot.image_config = source_config;
+    }
+
+    // The host page cache for the slot's block node still holds the previous
+    // stack's pages; drop them so reads reach the new stack.
+    clear_page_cache(&slot_path);
+
+    if new_sectors != old_sectors {
+        let slot = pool
+            .active_exclusive
+            .get(&slot_dev_id)
+            .context("slot device disappeared before resize")?;
+        let update = update_device_size(&slot.dev, new_sectors);
+        drop(slot);
+        update.await.with_context(|| {
+            format!(
+                "slot {slot_dev_id} adopted the new stack but resize to {new_sectors} sectors failed; \
+                 unbind before reusing the slot"
+            )
+        })?;
+    }
+
+    // The source device shell is no longer referenced: give it back to the pool
+    // (or delete it when pooling is off) while the slot keeps the image alive.
+    if let Err(err) = handle_release_overlaybd(pool_state, ctrl_ring, source_dev_id).await {
+        tracing::warn!(
+            source_dev_id,
+            error = %format_args!("{err:#}"),
+            "failed to release source device shell after slot adopt"
+        );
+    }
+
+    tracing::info!(
+        slot_dev_id,
+        source_dev_id,
+        virtual_size,
+        "slot adopted source overlaybd stack"
+    );
+    Ok(DaemonResponse::SlotTargetAdopted {
+        dev_id: slot_dev_id,
+        device_path: slot_path,
+        virtual_size,
+    })
+}
+
+/// Drop a slot device's adopted binding.
+///
+/// The slot is swapped onto a daemon-owned placeholder of the same virtual size
+/// (so no resize is involved) and the adopted `ImageFile` is dropped, releasing
+/// the bound sandbox's layer files. The slot node itself stays alive for the
+/// next adoption.
+async fn handle_unbind_slot(
+    pool_state: &Option<Arc<PoolState>>,
+    slot_dev_id: u32,
+) -> Result<DaemonResponse> {
+    let pool = pool_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("warm pool not enabled"))?;
+
+    let slot_guard = pool.slot_lock(slot_dev_id);
+    let _slot_guard = slot_guard.lock().await;
+
+    let (virtual_size, slot_path) = {
+        let slot = pool
+            .active_exclusive
+            .get(&slot_dev_id)
+            .with_context(|| format!("slot device {slot_dev_id} not found for unbind"))?;
+        (slot.image.size_bytes(), slot.dev.device_path())
+    };
+
+    let (placeholder_config, placeholder_image) = pool
+        .placeholder_for(virtual_size)
+        .await
+        .with_context(|| format!("build placeholder for slot {slot_dev_id} unbind"))?;
+    let discard_supported = !placeholder_image.is_read_only().await;
+
+    {
+        let mut slot = pool
+            .active_exclusive
+            .get_mut(&slot_dev_id)
+            .with_context(|| format!("slot device {slot_dev_id} disappeared during unbind"))?;
+        slot.dev
+            .target()
+            .swap_state(
+                placeholder_config.clone(),
+                Arc::clone(&placeholder_image),
+                discard_supported,
+            )
+            .with_context(|| format!("swap slot {slot_dev_id} to placeholder"))?;
+        slot.image = placeholder_image;
+        slot.image_config = placeholder_config;
+    }
+
+    // Same-size swap keeps the kernel geometry valid; still drop host-side
+    // cached pages of the released stack.
+    clear_page_cache(&slot_path);
+
+    tracing::info!(slot_dev_id, virtual_size, "slot binding released");
+    Ok(DaemonResponse::SlotUnbound {
+        dev_id: slot_dev_id,
+    })
 }
 
 // ── Helper functions ────────────────────────────────────────────────────────

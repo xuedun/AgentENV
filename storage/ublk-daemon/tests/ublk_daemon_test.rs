@@ -722,6 +722,16 @@ mod client_tests {
                 DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                 DaemonRequest::UpdateSize { .. } => DaemonResponse::SizeUpdated,
                 DaemonRequest::NotifySandboxReady { .. } => DaemonResponse::Ok,
+                DaemonRequest::AdoptSlotTarget { slot_dev_id, .. } => {
+                    DaemonResponse::SlotTargetAdopted {
+                        dev_id: slot_dev_id,
+                        device_path: PathBuf::from(format!("/dev/ublkb{slot_dev_id}")),
+                        virtual_size: 4096,
+                    }
+                }
+                DaemonRequest::UnbindSlot { slot_dev_id } => DaemonResponse::SlotUnbound {
+                    dev_id: slot_dev_id,
+                },
             }
         }))
         .await;

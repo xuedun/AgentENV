@@ -198,6 +198,20 @@ max_size_mb = 262144
 # Maximum number of persistent volumes a sandbox may mount.
 max_volume_count = 4
 
+[proxy]
+# Resident proxy sandbox pool. When enabled, the server starts a long-lived
+# proxy sandbox at startup whose deferred slot drives are attach-only block
+# devices reserved for runtime rebind to paused sandboxes' rootfs.
+enabled = true
+# Base image for the proxy sandbox (also the shared placeholder source for its
+# slot drives). Prefer a pinned tag: the digest feeds the proxy template identity.
+# Overridable via AENV_PROXY_IMAGE.
+image = "ubuntu:22.04"
+# Deferred slot drives reserved per proxy sandbox. Fixed for the proxy VM's
+# lifetime (Firecracker topology is immutable after boot); independent of the
+# 24 boot-mounted drive budget. Overridable via AENV_PROXY_SLOTS_PER_PROXY.
+slots_per_proxy = 24
+
 [orchestrator]
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000

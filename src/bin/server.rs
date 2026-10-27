@@ -131,6 +131,31 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&volume_manager),
     )
     .await?;
+
+    // Start the resident proxy sandbox (when [proxy] is enabled) in the
+    // background so the API listener is not blocked on cold-start image
+    // resolution. The proxy is infrastructure: startup failures are logged
+    // and the server keeps serving.
+    if config.proxy.enabled {
+        let proxy_orchestrator = Arc::clone(&orchestrator);
+        let proxy_image_resolver = Arc::clone(&image_resolver);
+        let proxy_snapshot_manager = Arc::clone(&snapshot_manager);
+        tokio::spawn(async move {
+            if let Err(err) = agentenv::orchestrator::init_proxy_pool(
+                proxy_orchestrator,
+                proxy_image_resolver,
+                proxy_snapshot_manager,
+            )
+            .await
+            {
+                warn!(
+                    target: "agentenv",
+                    error = %format_args!("{err:#}"),
+                    "failed to start resident proxy sandbox"
+                );
+            }
+        });
+    }
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(

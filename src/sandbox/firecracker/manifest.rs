@@ -65,6 +65,11 @@ pub struct FirecrackerAttachedDriveArtifacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_path: Option<PathBuf>,
     pub virtual_size: u64,
+    /// Whether the drive was attached without a boot-time guest mount. Proxy
+    /// slot drives set this; losing it on snapshot/restore would drop them
+    /// from the deferred-drive set and unregister the proxy's slots.
+    #[serde(default)]
+    pub defer_mount: bool,
     #[serde(skip)]
     pub image_config_path: PathBuf,
 }
@@ -114,6 +119,7 @@ impl FirecrackerSnapshotManifest {
                 sub_path: drive.sub_path.clone(),
                 snapshot_output_dir: None,
                 volume: false,
+                defer_mount: drive.defer_mount,
             })
             .collect()
     }
@@ -141,6 +147,7 @@ impl FirecrackerSnapshotManifest {
                     mount_path: drive.mount_path().to_path_buf(),
                     sub_path: drive.sub_path().map(Path::to_path_buf),
                     virtual_size,
+                    defer_mount: drive.defer_mount(),
                     image_config_path: drive.image_config_path().to_path_buf(),
                 })
             })
@@ -202,6 +209,7 @@ mod tests {
             sub_path: None,
             virtual_size: 4096,
             image_config_path: PathBuf::from("drives/data/image.json"),
+            defer_mount: false,
         };
 
         let known_json = serde_json::to_value(&known).unwrap();
@@ -240,6 +248,7 @@ mod tests {
             sub_path: None,
             snapshot_output_dir: None,
             volume: false,
+            defer_mount: false,
         };
 
         let err = FirecrackerSnapshotManifest::new(
@@ -275,6 +284,7 @@ mod tests {
             sub_path: None,
             snapshot_output_dir: None,
             volume: false,
+            defer_mount: false,
         };
 
         let err = manifest

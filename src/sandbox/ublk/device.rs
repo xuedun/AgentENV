@@ -447,6 +447,63 @@ impl UblkDeviceManager {
         }
     }
 
+    /// Make the slot device serve the source device's overlaybd stack.
+    ///
+    /// Proxy-sandbox rebind primitive: the slot keeps its `/dev/ublkbN` node
+    /// (fixed in the proxy VM's boot topology) while the daemon swaps its
+    /// backing stack and releases the source device shell.
+    pub(crate) async fn adopt_slot_target(
+        &self,
+        slot_dev_id: u32,
+        source_dev_id: u32,
+    ) -> Result<()> {
+        let client = self.require_client()?;
+        debug!(slot_dev_id, source_dev_id, "adopting slot target");
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "adopt_slot_target");
+        let result = client
+            .adopt_slot_target(slot_dev_id, source_dev_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "adopt overlaybd stack of device {source_dev_id} into slot device {slot_dev_id}"
+                )
+            });
+        metric.finish(&result);
+        result
+    }
+
+    /// Drop a slot device's adopted binding (slot returns to a placeholder).
+    pub(crate) async fn unbind_slot(&self, slot_dev_id: u32) -> Result<()> {
+        let client = self.require_client()?;
+        debug!(slot_dev_id, "unbinding slot");
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "unbind_slot");
+        let result = client
+            .unbind_slot(slot_dev_id)
+            .await
+            .with_context(|| format!("unbind overlaybd slot device {slot_dev_id}"));
+        metric.finish(&result);
+        result
+    }
+
+    /// Release a device by id (warm pool return, or delete when pooling is off).
+    pub(crate) async fn release_device_by_id(&self, dev_id: u32) -> Result<()> {
+        let client = self.require_client()?;
+        if !self.pool_enabled {
+            let device = UblkDevice {
+                dev_id,
+                device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
+            };
+            return self.delete_device(&device).await;
+        }
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "release");
+        let result = client
+            .release_overlaybd(dev_id)
+            .await
+            .context("release overlaybd device via daemon");
+        metric.finish(&result);
+        result
+    }
+
     /// Gracefully shut down the daemon process.
     pub async fn shutdown_daemon(&self) -> Result<()> {
         if let Some(client) = &self.client {
@@ -703,6 +760,11 @@ pub(crate) struct UblkDevice {
 impl UblkDevice {
     pub fn device_path(&self) -> &Path {
         &self.device_path
+    }
+
+    /// The daemon-assigned ublk device id.
+    pub(crate) fn dev_id(&self) -> u32 {
+        self.dev_id
     }
 }
 

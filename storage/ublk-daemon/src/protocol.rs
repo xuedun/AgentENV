@@ -71,6 +71,30 @@ pub enum DaemonRequest {
         dev_id: u32,
         new_sectors: u64,
     },
+    /// Make `slot_dev_id` serve `source_dev_id`'s overlaybd stack.
+    ///
+    /// The slot device keeps its identity (`/dev/ublkbN`, dev_id) while the
+    /// daemon atomically swaps its backing image and resizes it to the source
+    /// stack's virtual size. The source device is released afterwards (returned
+    /// to the warm pool, or deleted when pooling is disabled).
+    ///
+    /// This is the proxy-sandbox rebind primitive: Firecracker fixes device
+    /// paths at boot, so a slot's *content* — not its node — must change to
+    /// expose a different paused sandbox's rootfs. Requires UBLK_F_UPDATE_SIZE
+    /// unless both stacks happen to share the same virtual size.
+    AdoptSlotTarget {
+        slot_dev_id: u32,
+        source_dev_id: u32,
+    },
+    /// Drop a slot device's adopted binding.
+    ///
+    /// The slot returns to a daemon-owned placeholder of the same virtual size
+    /// so it stops pinning the released sandbox's layer files; its device node
+    /// stays alive for the next adoption. Same-size swap, so no resize is
+    /// involved.
+    UnbindSlot {
+        slot_dev_id: u32,
+    },
     Shutdown,
 }
 
@@ -119,6 +143,16 @@ pub enum DaemonResponse {
     },
     Released,
     SizeUpdated,
+    /// A slot device now serves the adopted source stack.
+    SlotTargetAdopted {
+        dev_id: u32,
+        device_path: PathBuf,
+        virtual_size: u64,
+    },
+    /// A slot device's adopted binding was dropped.
+    SlotUnbound {
+        dev_id: u32,
+    },
     Features {
         flags: u64,
     },
@@ -481,6 +515,71 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonResponse::SizeUpdated));
+    }
+
+    #[test]
+    fn request_adopt_slot_target_round_trip() {
+        let req = DaemonRequest::AdoptSlotTarget {
+            slot_dev_id: 7,
+            source_dev_id: 9,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::AdoptSlotTarget {
+                slot_dev_id,
+                source_dev_id,
+            } => {
+                assert_eq!(slot_dev_id, 7);
+                assert_eq!(source_dev_id, 9);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn request_unbind_slot_round_trip() {
+        let req = DaemonRequest::UnbindSlot { slot_dev_id: 7 };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::UnbindSlot { slot_dev_id } => assert_eq!(slot_dev_id, 7),
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn response_slot_target_adopted_round_trip() {
+        let resp = DaemonResponse::SlotTargetAdopted {
+            dev_id: 7,
+            device_path: PathBuf::from("/dev/ublkb7"),
+            virtual_size: 8 << 20,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonResponse::SlotTargetAdopted {
+                dev_id,
+                device_path,
+                virtual_size,
+            } => {
+                assert_eq!(dev_id, 7);
+                assert_eq!(device_path, PathBuf::from("/dev/ublkb7"));
+                assert_eq!(virtual_size, 8 << 20);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn response_slot_unbound_round_trip() {
+        let resp = DaemonResponse::SlotUnbound { dev_id: 7 };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonResponse::SlotUnbound { dev_id } => assert_eq!(dev_id, 7),
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]
