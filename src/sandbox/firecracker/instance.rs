@@ -31,6 +31,12 @@ use super::socket::UnixSocketClient;
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
 
+/// `RLIMIT_NOFILE` (soft and hard) for the spawned Firecracker process:
+/// `resize_fdtable` pre-grows the kernel fd table to the soft limit, and 2048
+/// is the jailer default — far above what a microVM build opens, but small
+/// enough that the table costs pages instead of megabytes.
+const FIRECRACKER_NOFILE_LIMIT: u64 = 2048;
+
 pub(crate) struct FirecrackerInstance {
     client: UnixSocketClient,
     work_dir: PathBuf,
@@ -96,10 +102,21 @@ impl FirecrackerInstance {
             })
             .transpose()?;
 
-        let mut cmd = Command::new(&firecracker_binary);
+        // Firecracker pre-grows its kernel fd table to the soft RLIMIT_NOFILE at
+        // startup (`resize_fdtable` dups stdin onto `limit - 1`), so with the
+        // server unit's `LimitNOFILE=1048576` every process start pays a
+        // multi-megabyte fd-table allocation that stalls in memory reclaim.
+        // glibc's posix_spawn has no rlimit attribute, and a pre_exec hook would
+        // force a fork+exec of the server; prlimit applies the capped limit and
+        // execs Firecracker in place, keeping the pid, process group, netns,
+        // and descriptor handoff unchanged.
+        let mut cmd = Command::new("/usr/bin/prlimit");
         cmd.process_group(0);
 
-        cmd.arg("--api-sock")
+        cmd.arg(format!("--nofile={FIRECRACKER_NOFILE_LIMIT}"))
+            .arg("--")
+            .arg(&firecracker_binary)
+            .arg("--api-sock")
             .arg(&self.socket_path)
             .arg("--mmds-size-limit")
             .arg(MMDS_SIZE_LIMIT.to_string())

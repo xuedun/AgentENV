@@ -70,6 +70,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         jq \
         sudo \
         umoci \
+        util-linux \
         zstd \
     && if [ -n "${EXTRA_RUNTIME_PACKAGES}" ]; then \
         printf '%s\n' "${EXTRA_RUNTIME_PACKAGES}" \
