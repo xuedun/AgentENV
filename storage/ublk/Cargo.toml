@@ -20,7 +20,6 @@ parking_lot = "0.12.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1", features = ["v5"] }
-arc-swap = "1.7"
 
 tracing = "0.1.41"
 tracing-log = "0.2.0"
