@@ -189,20 +189,102 @@ impl ReadOnlyIndex {
         Self { mappings }
     }
 
+    /// Merges layer indexes into one. `indexes[0]` is the newest layer; every
+    /// output range takes the tag of the newest layer mapping covering it.
+    ///
+    /// Each input index must be sorted by offset and internally disjoint —
+    /// the LSMT on-disk index format guarantees this. The sweep below keeps
+    /// the exact piece boundaries of the B-tree overlay it replaces (adjacent
+    /// pieces are not coalesced), but runs in a single pass with no
+    /// per-mapping allocations: the B-tree version paid a node insert/remove
+    /// and an overlap scan for every mapping of every layer, which dominated
+    /// open and restack profiles under high pause/resume concurrency.
     pub fn merge(indexes: &[&ReadOnlyIndex]) -> Self {
-        let mut mi = MutableIndex::new();
+        let layers = indexes.len();
+        // Per-layer cursor into the next unconsumed mapping.
+        let mut next: Vec<usize> = vec![0; layers];
+        // Mappings are disjoint within a layer, so at most one mapping per
+        // layer covers the sweep position `pos`.
+        let mut active: Vec<Option<SegmentMapping>> = vec![None; layers];
+        let total_mappings: usize = indexes.iter().map(|idx| idx.mappings.len()).sum();
+        let mut merged: Vec<SegmentMapping> = Vec::with_capacity(total_mappings);
+        let mut pos = 0u64;
 
-        for (i, idx) in indexes.iter().enumerate().rev() {
-            for m in &idx.mappings {
-                let mut m_new = *m;
-                // tag = 0 means the newest/top layer
-                // The smaller the tag is, the newer the data is
-                m_new.tag = i as u8;
-                mi.insert(m_new);
+        loop {
+            for (layer, idx) in indexes.iter().enumerate() {
+                let mut cursor = next[layer];
+                while let Some(m) = idx.mappings.get(cursor) {
+                    if m.offset() > pos {
+                        break;
+                    }
+                    if m.length() > 0 {
+                        let prev = active[layer].replace(*m);
+                        debug_assert!(
+                            prev.is_none_or(|prev| prev.end() <= pos),
+                            "layer {layer} mappings must be sorted and disjoint"
+                        );
+                    }
+                    cursor += 1;
+                }
+                next[layer] = cursor;
             }
+
+            // A run of a newer layer can sweep past the start of an older
+            // mapping without the sweep stopping there (older starts never
+            // truncate a newer run). If the newer coverage consumed the older
+            // mapping entirely, it must never surface — the B-tree version
+            // removed such mappings on overlap.
+            for slot in active.iter_mut() {
+                if slot.is_some_and(|m| m.end() <= pos) {
+                    *slot = None;
+                }
+            }
+
+            let Some(winner_layer) = active.iter().position(Option::is_some) else {
+                // Nothing covers `pos`; jump to the next mapped start.
+                let Some(jump) = indexes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(layer, idx)| {
+                        idx.mappings
+                            .get(next[layer])
+                            .and_then(|m| (m.length() > 0).then_some(m.offset()))
+                    })
+                    .min()
+                else {
+                    break;
+                };
+                pos = jump;
+                continue;
+            };
+            let mut winner = active[winner_layer].take().expect("winner just checked");
+            debug_assert!(winner.offset() <= pos && pos < winner.end());
+
+            // Only a newer layer's next mapping can override the winner before
+            // it ends; older layers never truncate a newer run.
+            let mut run_end = winner.end();
+            for layer in 0..winner_layer {
+                if let Some(m) = indexes[layer].mappings.get(next[layer]) {
+                    if m.length() > 0 && m.offset() < run_end {
+                        run_end = m.offset();
+                    }
+                }
+            }
+
+            let mut piece = winner;
+            piece.forward_offset_to(pos);
+            piece.backward_end_to(run_end);
+            piece.tag = winner_layer as u8;
+            merged.push(piece);
+
+            if run_end < winner.end() {
+                winner.forward_offset_to(run_end);
+                active[winner_layer] = Some(winner);
+            }
+            pos = run_end;
         }
 
-        ReadOnlyIndex::new(mi.dump())
+        ReadOnlyIndex::new(merged)
     }
 
     pub fn mappings(&self) -> &[SegmentMapping] {
@@ -1146,5 +1228,111 @@ mod tests {
         ];
         let n = compress_raw_index(&mut mappings);
         assert_eq!(n, 2); // Cannot merge due to MAX_LENGTH constraint
+    }
+
+    // ── merge: k-way sweep vs the historical B-tree overlay ────────────────
+
+    /// The merge implementation the sweep replaces, kept as the behavioral
+    /// oracle: per-mapping newest-layer override through `MutableIndex`.
+    fn merge_reference(indexes: &[&ReadOnlyIndex]) -> ReadOnlyIndex {
+        let mut mi = MutableIndex::new();
+        for (i, idx) in indexes.iter().enumerate().rev() {
+            for m in &idx.mappings {
+                let mut m_new = *m;
+                m_new.tag = i as u8;
+                mi.insert(m_new);
+            }
+        }
+        ReadOnlyIndex::new(mi.dump())
+    }
+
+    /// Deterministic LCG so failures reproduce exactly.
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// A random, sorted, internally disjoint layer over `0..space`.
+    fn random_layer(rng: &mut Lcg, space: u64) -> ReadOnlyIndex {
+        let mut mappings = Vec::new();
+        let mut cursor = 0u64;
+        while cursor < space {
+            cursor += rng.below(4);
+            if cursor >= space {
+                break;
+            }
+            let length = 1 + rng.below(16.min(space - cursor));
+            let zeroed = rng.below(4) == 0;
+            let moffset = if zeroed { 0 } else { 1 + rng.below(4096) };
+            mappings.push(SegmentMapping::new(
+                cursor,
+                length as u32,
+                moffset,
+                zeroed,
+                0,
+            ));
+            cursor += length;
+        }
+        ReadOnlyIndex::new(mappings)
+    }
+
+    #[test]
+    fn test_readonly_merge_sweep_matches_btree_overlay() {
+        let mut rng = Lcg(0x5eed);
+        for case in 0..512u32 {
+            let layers = rng.below(7) as usize;
+            let space = 1 + rng.below(256);
+            let indexes: Vec<ReadOnlyIndex> =
+                (0..layers).map(|_| random_layer(&mut rng, space)).collect();
+            let refs: Vec<&ReadOnlyIndex> = indexes.iter().collect();
+
+            let sweep = ReadOnlyIndex::merge(&refs);
+            let oracle = merge_reference(&refs);
+            assert_eq!(
+                sweep.mappings, oracle.mappings,
+                "case {case}: layers {layers}, space {space}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_readonly_merge_drops_older_mappings_covered_by_newer_runs() {
+        // The newer run [5, 100) sweeps past the older [50, 60) start; the
+        // covered mapping must not resurface after the sweep.
+        let older = ReadOnlyIndex::new(vec![sm(0, 10, 1), sm(50, 10, 2)]);
+        let newer = ReadOnlyIndex::new(vec![sm_tag(5, 95, 9, 0)]);
+        let merged = ReadOnlyIndex::merge(&[&newer, &older]);
+        assert_mappings_eq(&merged.mappings, &[sm_tag(0, 5, 1, 1), sm_tag(5, 95, 9, 0)]);
+
+        // Partial newer coverage leaves the older tail.
+        let newer = ReadOnlyIndex::new(vec![sm_tag(5, 50, 9, 0)]);
+        let merged = ReadOnlyIndex::merge(&[&newer, &older]);
+        assert_mappings_eq(
+            &merged.mappings,
+            &[sm_tag(0, 5, 1, 1), sm_tag(5, 50, 9, 0), sm_tag(55, 5, 7, 1)],
+        );
+    }
+
+    #[test]
+    fn test_readonly_merge_zeroed_and_mid_fragment() {
+        let base = ReadOnlyIndex::new(vec![SegmentMapping::new(0, 100, 7, false, 0)]);
+        let mid = ReadOnlyIndex::new(vec![SegmentMapping::new(40, 20, 0, true, 0)]);
+        let top = ReadOnlyIndex::new(vec![sm_tag(50, 10, 99, 0)]);
+        let merged = ReadOnlyIndex::merge(&[&top, &mid, &base]);
+        assert_mappings_eq(
+            &merged.mappings,
+            &[
+                sm_tag(0, 40, 7, 2),
+                SegmentMapping::new(40, 10, 0, true, 1),
+                sm_tag(50, 10, 99, 0),
+                sm_tag(60, 40, 67, 2),
+            ],
+        );
     }
 }
