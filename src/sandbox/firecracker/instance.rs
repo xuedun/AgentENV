@@ -33,10 +33,13 @@ const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
 
 /// `RLIMIT_NOFILE` (soft and hard) for the spawned Firecracker process:
-/// `resize_fdtable` pre-grows the kernel fd table to the soft limit, and 2048
-/// is the jailer default — far above what a microVM build opens, but small
-/// enough that the table costs pages instead of megabytes.
-const FIRECRACKER_NOFILE_LIMIT: u64 = 2048;
+/// `resize_fdtable` pre-grows the kernel fd table to the soft limit, so the
+/// cap is kept small enough that the table costs pages instead of megabytes.
+/// Each async (io_uring) virtio-blk drive holds ~6 fds (ring, completion
+/// eventfd, queue/irq/activate eventfds, backing file), so a resident proxy
+/// VM with 952 deferred slot drives needs ~5.8K fds; 8192 covers the
+/// MAX_DEFERRED_EXTRA_DRIVES ceiling with headroom.
+const FIRECRACKER_NOFILE_LIMIT: u64 = 8192;
 
 pub(crate) struct FirecrackerInstance {
     client: UnixSocketClient,
