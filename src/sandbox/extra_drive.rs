@@ -18,7 +18,12 @@ pub(crate) const VOLUME_DRIVE_SLOT_PREFIX: &str = "agentenv_volume_slot_";
 /// the boot-time `agentenv_drives` mount protocol, so they are not limited by
 /// `MAX_EXTRA_DRIVES`' single-letter device naming; this bound only guards
 /// against exhausting kernel ublk device and virtio slot budgets.
-pub const MAX_DEFERRED_EXTRA_DRIVES: usize = 128;
+///
+/// The effective ceiling is Firecracker's aarch64 legacy GSI pool (960 after
+/// the `SPI_END = 991` patch). A proxy VM spends 8 GSIs on fixed devices
+/// (serial, rtc, vmgenid, vmclock, balloon, vda tools drive, vdb rootfs, and
+/// the net device), leaving 952 for deferred slot drives.
+pub const MAX_DEFERRED_EXTRA_DRIVES: usize = 952;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExtraDrive {

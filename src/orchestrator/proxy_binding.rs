@@ -1630,5 +1630,13 @@ mod tests {
         assert_eq!(proxy_slot_device_name(49), "vdaz");
         assert_eq!(proxy_slot_device_name(50), "vdba");
         assert_eq!(proxy_slot_device_name(699), "vdzz");
+        // Three-letter names start at slot 700; the last permitted slot under
+        // MAX_DEFERRED_EXTRA_DRIVES = 952 is index 951.
+        assert_eq!(proxy_slot_device_name(700), "vdaaa");
+        assert_eq!(proxy_slot_device_name(701), "vdaab");
+        assert_eq!(
+            proxy_slot_device_name(crate::sandbox::MAX_DEFERRED_EXTRA_DRIVES - 1),
+            "vdajr"
+        );
     }
 }

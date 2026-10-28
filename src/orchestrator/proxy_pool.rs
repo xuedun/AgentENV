@@ -43,7 +43,8 @@ const PROXY_SANDBOX_TTL: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 pub const PROXY_METADATA_KEY: &str = "aenv:proxy";
 
 /// Deferred slot drive id prefix; slot `i` is `proxy_slot_{i}` and maps to
-/// guest device `vd(c + i)` (two-letter naming beyond `vdz`).
+/// guest device `vd(c + i)` under the kernel's virtio-blk naming (multi-letter
+/// beyond `vdz`).
 const SLOT_DRIVE_ID_PREFIX: &str = "proxy_slot_";
 
 /// Guest directory under which a bound target's rootfs is mounted
@@ -56,21 +57,31 @@ pub fn proxy_slot_drive_id(index: usize) -> String {
 }
 
 /// Guest device name for slot `index`, matching the kernel's virtio-blk
-/// auto-naming: `vdc..vdz` for the first 24 slots, then `vdaa..vdzz`.
+/// auto-naming (`virtblk_name_format` in drivers/block/virtio_blk.c):
+/// `vdc..vdz` for the first 24 slots, then `vdaa..vdzz`, then `vdaaa..`.
 ///
-/// vda is the tools drive and vdb the proxy rootfs, so slots start at vdc.
-/// envd mounts whatever path it is given and never parses the letter, so
-/// two-letter names need no guest-side cooperation.
+/// vda is the tools drive and vdb the proxy rootfs, so slots start at vdc
+/// (kernel disk index = slot + 2). envd mounts whatever path it is given and
+/// never parses the letter, so multi-letter names need no guest-side
+/// cooperation.
 pub fn proxy_slot_device_name(index: usize) -> String {
-    const SINGLE_LETTER_SLOTS: usize = (b'z' - b'c' + 1) as usize;
-    if index < SINGLE_LETTER_SLOTS {
-        format!("vd{}", (b'c' + index as u8) as char)
-    } else {
-        let beyond = index - SINGLE_LETTER_SLOTS;
-        let first = b'a' + (beyond / 26) as u8;
-        let second = b'a' + (beyond % 26) as u8;
-        format!("vd{}{}", first as char, second as char)
+    // Bijective base-26 encoding of the kernel's disk index, identical to
+    // virtblk_name_format: emit `index % 26`, then iterate on
+    // `index / 26 - 1` until negative.
+    const BASE: usize = 26;
+    let mut disk_index = index + 2;
+    let mut letters: Vec<u8> = Vec::with_capacity(4);
+    loop {
+        letters.push(b'a' + (disk_index % BASE) as u8);
+        disk_index = disk_index / BASE;
+        if disk_index == 0 {
+            break;
+        }
+        disk_index -= 1;
     }
+    letters.reverse();
+    let suffix: String = letters.iter().map(|&b| b as char).collect();
+    format!("vd{suffix}")
 }
 
 /// Prefix of the committed-snapshot alias under which the proxy template is
