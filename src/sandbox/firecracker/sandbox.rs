@@ -592,10 +592,18 @@ impl FirecrackerSandbox {
                 .into_iter()
                 .partition(|drive| !drive.is_volume());
         config.common.physical_extra_drive_count = physical_drives.len();
+        // Volume slots share the single-letter vdc..vdz boot-mount budget with
+        // non-deferred extra drives only: deferred (attach-only) drives skip
+        // the `agentenv_drives` boot protocol, so they do not consume that
+        // budget (proxy slot pools exceed 24 deferred drives legitimately).
+        let boot_mounted_physical = physical_drives
+            .iter()
+            .filter(|drive| !drive.defer_mount())
+            .count();
         config.common.volume_drive_slots = ConfigManager::global_config()
             .volume
             .max_volume_count
-            .min(MAX_EXTRA_DRIVES.saturating_sub(config.common.physical_extra_drive_count));
+            .min(MAX_EXTRA_DRIVES.saturating_sub(boot_mounted_physical));
         anyhow::ensure!(
             volume_drives.len() <= config.common.volume_drive_slots,
             "fresh sandbox has {} volumes but only {} reserved volume slots",
@@ -2290,10 +2298,28 @@ impl FirecrackerSandbox {
                 read_only: false,
             });
         }
+        // The boot-mounted (non-deferred) extra drives and the volume slots
+        // share the single-letter `vdc..vdz` device-name budget reserved by
+        // the `agentenv_drives` boot protocol. Deferred (attach-only) drives
+        // skip that protocol (see `build_drives_boot_arg`) and are excluded
+        // from the count: `physical_extra_drive_count` counts every non-volume
+        // drive, deferred or not, so the deferred share must be subtracted
+        // here or large proxy slot pools (>24) are wrongly rejected.
+        let deferred_count = self
+            .launch
+            .common()
+            .extra_drives
+            .iter()
+            .filter(|drive| drive.defer_mount())
+            .count();
+        let boot_mounted_physical = physical_extra_drive_count
+            .saturating_sub(deferred_count)
+            .min(physical_extra_drive_count);
         anyhow::ensure!(
-            physical_extra_drive_count + slots.len() <= MAX_EXTRA_DRIVES,
-            "{} physical extra drives plus {} volume slots exceed Firecracker's {}-drive limit",
-            physical_extra_drive_count,
+            boot_mounted_physical + slots.len() <= MAX_EXTRA_DRIVES,
+            "{} boot-mounted extra drives plus {} volume slots exceed the {}-drive \
+             boot-mount budget (vdc..vdz); deferred drives are not counted",
+            boot_mounted_physical,
             slots.len(),
             MAX_EXTRA_DRIVES
         );
